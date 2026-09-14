@@ -1,3 +1,5 @@
 manifest.js
 *.bak-*
 *.log
+models/
+walls/

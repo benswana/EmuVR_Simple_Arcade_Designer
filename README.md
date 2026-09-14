@@ -70,7 +70,7 @@ It edits the same `Saved Data\Rooms\Slot<N>.json` files EmuVR uses, and it makes
      Saved Data\
      RoomEditor\     <- this project
    ```
-3. **Build the shape data for your own models and levels.** This is recommended; it takes about a minute:
+3. **Build the shape data for your own models and levels.** This takes about a minute:
    ```bat
    cd /d "D:\EmuVR\RoomEditor"
    node tools\extract_models.mjs
@@ -79,7 +79,9 @@ It edits the same `Saved Data\Rooms\Slot<N>.json` files EmuVR uses, and it makes
    - `extract_models` reads every model in `Custom\UGC` and records its real size and which way its screen faces. It writes `models\index.json`.
    - `extract_walls` slices each level model at waist height to get its walls. It writes `walls\levels\`.
 
-   The copies included in this repository were built from one particular install, so run both again after you add new UGC cabinets or levels.
+   This data is built from the content in your own EmuVR folder, so it isn't included in this repository.
+   - **Without it,** the editor still works, but cabinets are drawn as guessed boxes with no front dots, and level walls aren't shown.
+   - **Run both commands again** whenever you add new UGC cabinets or levels.
 4. **Start the editor:** double-click `tools\Start RoomEditor.cmd`. It starts a small local web server on `http://localhost:8765` and opens the editor in your browser. Leave the black window open while you work; close it when you're done.
 5. **Open your room:**
    1. Click **Pick EmuVR folder** and choose your EmuVR folder (for example `D:\EmuVR`).
@@ -203,11 +205,14 @@ Some tests read real files from an EmuVR install and are skipped when those file
 ## Legal
 
 - **No games included.** Arcade Designer only reads and writes EmuVR room layout files and reads the model and level files already in your EmuVR folder. It includes no games, ROMs, BIOS files or copyrighted artwork.
+- **No model or level data included.** The size, facing and wall data it uses is generated on your own PC from content you installed, and is never distributed.
 - **No piracy.** I don't condone piracy. Legally source every game, ROM and BIOS file you use.
 - **Trademarks.** EmuVR, game titles and cabinet names belong to their respective owners.
 
 ## Licence
 
-GNU General Public License v3.0 — see [LICENSE](LICENSE).
+Copyright (C) 2026 benswana
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full text.
 
 *Not affiliated with EmuVR. Always keep backups of rooms you care about.*
