@@ -1,0 +1,46 @@
+{
+  "levelId": "ugc_Level_Pizza_Hut_dc858033",
+  "source": "Level_Pizza_Hut_dc858033_[temp_level_stopgap_1234578].ugc",
+  "sliceY": -2.969,
+  "usedBy": [],
+  "segments": [
+    [-49.06,-86.22,0,-86.22],
+    [-49.06,13.26,0,13.26],
+    [0,-86.22,0,13.26],
+    [-49.06,-86.22,-49.06,13.26]
+  ],
+  "bounds": {"minX":-49.06,"maxX":0,"minZ":-86.22,"maxZ":13.26},
+  "stats": {
+    "meshColliders": 0,
+    "boxColliders": 1,
+    "skippedCompressed": 0,
+    "skippedExternal": 0,
+    "skippedDisabled": 0,
+    "skippedNullMesh": 0,
+    "skippedFormat": 0,
+    "badIndices": 0,
+    "triangles": 12,
+    "root": {
+      "name": "pizzahut",
+      "position": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": {
+        "x": 0,
+        "y": 0,
+        "z": 0,
+        "w": 1
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "via": "container"
+    },
+    "floorY": -3.969,
+    "rawSegments": 8
+  }
+}

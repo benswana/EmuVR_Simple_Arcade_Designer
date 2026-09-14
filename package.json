@@ -1,0 +1,8 @@
+{
+  "name": "arcade-designer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Top-down room editor for EmuVR arcade rooms",
+  "type": "module",
+  "scripts": { "test": "node --test \"tests/**/*.test.js\"" }
+}

@@ -1,0 +1,64 @@
+{
+  "levelId": "ugc_Neon_Arcade_728949d8",
+  "source": "Neon_Arcade_728949d8_[temp_level_stopgap_12345789].ugc",
+  "sliceY": 0.508,
+  "usedBy": [
+    "Slot21",
+    "Slot22",
+    "Slot23",
+    "Slot24",
+    "Slot25"
+  ],
+  "segments": [
+    [7.92,5.84,7.92,6.07],
+    [-7.95,5.84,-7.95,6.07],
+    [-7.95,6.07,7.92,6.07],
+    [-7.95,5.84,7.92,5.84],
+    [7.7,-6.14,7.93,-6.14],
+    [7.7,6.09,7.93,6.09],
+    [7.93,-6.14,7.93,6.09],
+    [7.7,-6.14,7.7,6.09],
+    [7.92,-6.13,7.92,-5.9],
+    [-7.95,-6.13,-7.95,-5.9],
+    [-7.95,-5.9,7.92,-5.9],
+    [-7.95,-6.13,7.92,-6.13],
+    [-7.94,-6.14,-7.7,-6.14],
+    [-7.94,6.09,-7.7,6.09],
+    [-7.7,-6.14,-7.7,6.09],
+    [-7.94,-6.14,-7.94,6.09]
+  ],
+  "bounds": {"minX":-7.95,"maxX":7.93,"minZ":-6.14,"maxZ":6.09},
+  "stats": {
+    "meshColliders": 0,
+    "boxColliders": 17,
+    "skippedCompressed": 0,
+    "skippedExternal": 0,
+    "skippedDisabled": 0,
+    "skippedNullMesh": 0,
+    "skippedFormat": 0,
+    "badIndices": 0,
+    "triangles": 204,
+    "root": {
+      "name": "arcade neon",
+      "position": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": {
+        "x": 0,
+        "y": 0,
+        "z": 0,
+        "w": 1
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "via": "container"
+    },
+    "floorY": -0.492,
+    "rawSegments": 32
+  }
+}

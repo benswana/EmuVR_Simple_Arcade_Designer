@@ -1,0 +1,25 @@
+{
+  "version": 6.0,
+  "time": 0.1,
+  "season": 0,
+  "objects": [
+    { "embedded_screen": 0 },
+    { "embedded_screen": 1 },
+    { "embedded_screen": 2 },
+    { "id": "ugc_Decor_Plant_dddd4444",
+      "position": { "x": 0, "y": 0, "z": 0 }, "rotation": { "x": 0, "y": 0, "z": 0, "w": 1 }, "frozen": true }
+  ],
+  "systems": [
+    { "id": "ugc_Arcade_Pac-Man_aaaa1111", "path": "Games\\MAME\\pacman.zip", "open": true, "embedded_screen": 0,
+      "position": { "x": 1, "y": 0, "z": 2 }, "rotation": { "x": 0, "y": 0, "z": 0, "w": 1 }, "scale": 1.0, "frozen": true },
+    { "id": "ugc_Arcade_Galaga_bbbb2222", "path": "Games\\MAME Vertical\\galaga.zip", "embedded_screen": 1,
+      "position": { "x": 3, "y": 0, "z": 2 }, "rotation": { "x": 0, "y": 0.7071068, "z": 0, "w": 0.7071068 }, "scale": 1.0, "frozen": true },
+    { "id": "ugc_Arcade_Daytona_USA_cccc3333", "path": "Games\\Arcade (Capture)\\Daytona USA.win", "embedded_screen": 2,
+      "position": { "x": 6, "y": 0, "z": 2 }, "rotation": { "x": 0, "y": 0, "z": 0, "w": 1 }, "scale": 0.03, "frozen": true },
+    { "id": "PlayStation 2",
+      "position": { "x": 8, "y": 1, "z": 2 }, "rotation": { "x": 0, "y": 0, "z": 0, "w": 1 }, "scale": 1, "frozen": true }
+  ],
+  "games": [
+    { "path": "Games\\PS2\\Gran Turismo 4.iso", "position": { "x": 8, "y": 1.2, "z": 2 }, "rotation": { "x": 0, "y": 0, "z": 0, "w": 1 }, "scale": 1 }
+  ]
+}

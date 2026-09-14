@@ -1,0 +1,22 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Arcade Designer</title><link rel="icon" href="data:,">
+<style>
+body{margin:0;font:13px system-ui;background:#0d1117;color:#c9d1d9;display:grid;grid-template-rows:auto 1fr;height:100vh}
+#bar{padding:8px;background:#161b22;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#main{display:grid;grid-template-columns:1fr 340px;min-height:0}
+#plan{width:100%;height:100%;display:block;min-width:0;background:#0d1117}
+#side{overflow:auto;padding:10px;background:#161b22;border-left:1px solid #30363d;min-width:0}
+#panel label,#panel div{display:block;margin:4px 0} input,select,button{font:inherit}
+.badge.live{color:#3fb950}.badge.dead{color:#f85149}.badge.unknown{color:#8b949e}.warn{color:#d29922}.hint{color:#8b949e}.sug{color:#8b949e;font-size:12px}
+.lib select{width:100%}
+</style></head>
+<body>
+<div id="bar"><button id="pick">Pick EmuVR folder</button> Slot <input id="slot" type="number" value="6" style="width:4em"> <button id="load">Load</button> or file <input id="file" type="file" accept=".json"> <button id="save">Save</button>
+<button id="undo" disabled>Undo</button> <button id="redo" disabled>Redo</button> <button id="align">Align row (Z)</button>
+<button id="trace">Trace walls</button> <button id="savewalls">Save walls</button> <button id="clearwalls">Clear traced walls</button> <span id="status">mode: ?</span></div>
+<div id="main"><canvas id="plan"></canvas><div id="side"><div id="panel">Nothing selected</div><hr><div id="library"></div></div></div>
+<script src="manifest.js"></script>
+<script type="module">
+import startApp from './src/app.js';
+const c = document.getElementById('plan'); const fit = () => { c.width = c.clientWidth; c.height = c.clientHeight; }; fit(); window.addEventListener('resize', fit);
+startApp(document);
+</script></body></html>

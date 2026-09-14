@@ -1,0 +1,1278 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Arcade Designer</title><link rel="icon" href="data:,">
+<style>
+body{margin:0;font:13px system-ui;background:#0d1117;color:#c9d1d9;display:grid;grid-template-rows:auto 1fr;height:100vh}
+#bar{padding:8px;background:#161b22;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#main{display:grid;grid-template-columns:1fr 340px;min-height:0}
+#plan{width:100%;height:100%;display:block;min-width:0;background:#0d1117}
+#side{overflow:auto;padding:10px;background:#161b22;border-left:1px solid #30363d;min-width:0}
+#panel label,#panel div{display:block;margin:4px 0} input,select,button{font:inherit}
+.badge.live{color:#3fb950}.badge.dead{color:#f85149}.badge.unknown{color:#8b949e}.warn{color:#d29922}.hint{color:#8b949e}.sug{color:#8b949e;font-size:12px}
+.lib select{width:100%}
+</style></head>
+<body>
+<div id="bar"><button id="pick">Pick EmuVR folder</button> Slot <input id="slot" type="number" value="6" style="width:4em"> <button id="load">Load</button> or file <input id="file" type="file" accept=".json"> <button id="save">Save</button>
+<button id="undo" disabled>Undo</button> <button id="redo" disabled>Redo</button> <button id="align">Align row (Z)</button>
+<button id="trace">Trace walls</button> <button id="savewalls">Save walls</button> <button id="clearwalls">Clear traced walls</button> <span id="status">mode: ?</span></div>
+<div id="main"><canvas id="plan"></canvas><div id="side"><div id="panel">Nothing selected</div><hr><div id="library"></div></div></div>
+<script src="manifest.js"></script>
+<script>
+// Built by tools/build.ps1 from index.html + src/*.js - do not edit; edit the sources and rebuild.
+// ---- src/quat.js ----
+// Hamilton product: qmul(a, b) = rotate by b first, then by a (Unity's a * b).
+function qmul(a, b) {
+  return {
+    x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+    y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+    z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+  };
+}
+// v' = q v q* (q assumed unit).
+function rotateVec(q, [vx, vy, vz]) {
+  const { x, y, z, w } = q;
+  const tx = 2 * (y * vz - z * vy), ty = 2 * (z * vx - x * vz), tz = 2 * (x * vy - y * vx);
+  return [vx + w * tx + (y * tz - z * ty), vy + w * ty + (z * tx - x * tz), vz + w * tz + (x * ty - y * tx)];
+}
+// Heading of the model's local right axis (+X) on the floor plane, Unity Y-up: at yaw t, right = (cos t, 0, -sin t).
+// Using the right axis (not forward) keeps the value meaningful for models authored Z-up that carry a 90-degree X tilt;
+// the Euler-angle formula is degenerate for those.
+function yawFromQuat(q) {
+  const [rx, , rz] = rotateVec(q, [1, 0, 0]);
+  return Math.atan2(-rz, rx) + 0; // + 0 turns -0 into 0
+}
+function quatFromYaw(yaw) {
+  return { x: 0, y: Math.sin(yaw / 2), z: 0, w: Math.cos(yaw / 2) };
+}
+// Heading of the model's forward (+Z) on the plan, Unity Y-up: forward = (sin t, cos t) -> t. 0 = +Z (north), clockwise positive.
+function headingOf(q) {
+  const [fx, , fz] = rotateVec(q || { x: 0, y: 0, z: 0, w: 1 }, [0, 0, 1]);
+  return Math.atan2(fx, fz) + 0; // + 0 turns -0 into 0
+}
+// Heading as drawn on the plan, dial and number box (0 = +Z, clockwise towards +X): the forward axis; models
+// authored Z-up (90-degree X tilt) have a vertical forward, so fall back to the right-axis yaw for those.
+function planHeading(q) {
+  if (!q) return 0;
+  const [fx, , fz] = rotateVec(q, [0, 0, 1]);
+  return Math.hypot(fx, fz) > 0.25 ? headingOf(q) : yawFromQuat(q);
+}
+const degrees = (r) => (r * 180) / Math.PI;
+const radians = (d) => (d * Math.PI) / 180;
+// ---- src/controlsMath.js ----
+// Pure math for the direction dial and the logarithmic scale slider (no DOM).
+
+const TAU = Math.PI * 2;
+
+// Angle of the pointer around the dial centre in screen coordinates (y grows downward):
+// 0 = up/north, clockwise positive, range (-PI, PI].
+function pointerToAngle(cx, cy, px, py) {
+  return Math.atan2(px - cx, cy - py) + 0; // + 0 turns -0 into 0
+}
+
+// Round an angle (radians) to the nearest stepDeg degrees; free = true returns it unchanged.
+function snapAngle(a, stepDeg = 15, free = false) {
+  if (free || !(stepDeg > 0)) return a;
+  const deg = (a * 180) / Math.PI;
+  return ((Math.round(deg / stepDeg) * stepDeg) * Math.PI) / 180 + 0;
+}
+
+// Shortest signed turn from `from` to `to`, in (-PI, PI].
+function angleDelta(from, to) {
+  let d = (to - from) % TAU;
+  if (d <= -Math.PI) d += TAU;
+  else if (d > Math.PI) d -= TAU;
+  return d + 0;
+}
+
+// Slider range 0..1000 covers centre/100 .. centre*100 on a log scale; 500 = centre. No rounding here.
+const SLIDER_MAX = 1000, DECADES = 2;
+const PER_DECADE = SLIDER_MAX / (2 * DECADES);
+
+function scaleToSlider(scale, centre) {
+  if (!(scale > 0) || !(centre > 0)) return scale > 0 ? SLIDER_MAX / 2 : 0;
+  const v = SLIDER_MAX / 2 + PER_DECADE * Math.log10(scale / centre);
+  return Math.min(SLIDER_MAX, Math.max(0, v));
+}
+
+function sliderToScale(v, centre) {
+  const c = Math.min(SLIDER_MAX, Math.max(0, Number(v)));
+  return centre * Math.pow(10, (c - SLIDER_MAX / 2) / PER_DECADE);
+}
+
+// Multiply a scale by factor: a number stays a number, an {x,y,z} vector keeps its proportions.
+function uniformScale(s, factor) {
+  if (s && typeof s === 'object') return { x: s.x * factor, y: s.y * factor, z: s.z * factor };
+  return s * factor;
+}
+// ---- src/planGeom.js ----
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+// Top-down view of EmuVR's Unity world (X right, Y up, Z forward) as seen from above: +X to the right and +Z UP the
+// screen. Screen y grows downward, so z is negated; drawing +Z downward would show the room mirrored.
+function planView({ camX, camZ, zoom, width, height }) {
+  return {
+    toScreen: (x, z) => [(x - camX) * zoom + width / 2, (camZ - z) * zoom + height / 2],
+    toWorld: (sx, sy) => [(sx - width / 2) / zoom + camX, camZ - (sy - height / 2) / zoom],
+  };
+}
+function footprintSize(modelId, scale = 1) {
+  const wide = /Twin|SDX|_DX|Deluxe|Sit|Racer|Driver|Motion/i.test(modelId || '');
+  // scale may be a {x,y,z} vector (EmuVR non-uniform scale); footprint uses its floor-plane components
+  const sx = Number.isFinite(scale) ? scale : (scale && Number.isFinite(scale.x) ? scale.x : 1);
+  const sz = Number.isFinite(scale) ? scale : (scale && Number.isFinite(scale.z) ? scale.z : 1);
+  return { w: clamp(0.8 * (wide ? 1.8 : 1) * sx, 0.2, 12), d: clamp(0.9 * sz, 0.2, 12) };
+}
+function obbCorners(x, z, yaw, w, d) {
+  const c = Math.cos(yaw), s = Math.sin(yaw), hw = w / 2, hd = d / 2;
+  // Unity Y-up: at yaw t, forward (local +z) = (sin t, cos t) and right (local +x) = (cos t, -sin t)
+  return [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]].map(([lx, lz]) => [x + lx * c + lz * s, z - lx * s + lz * c]);
+}
+function pointInObb(px, pz, k) {
+  let sign = 0;
+  for (let i = 0; i < 4; i++) { const [ax, az] = k[i], [bx, bz] = k[(i + 1) % 4];
+    const cross = (bx - ax) * (pz - az) - (bz - az) * (px - ax);
+    if (cross !== 0) { const sg = Math.sign(cross); if (sign === 0) sign = sg; else if (sg !== sign) return false; } }
+  return true;
+}
+function obbOverlap(a, b) {
+  const axes = [];
+  for (const k of [a, b]) for (let i = 0; i < 2; i++) { const [ax, az] = k[i], [bx, bz] = k[i + 1]; axes.push([-(bz - az), bx - ax]); }
+  for (const [nx, nz] of axes) {
+    const proj = (k) => k.map(([x, z]) => x * nx + z * nz);
+    const pa = proj(a), pb = proj(b);
+    if (Math.max(...pa) < Math.min(...pb) || Math.max(...pb) < Math.min(...pa)) return false;
+  }
+  return true;
+}
+// ---- src/modelShape.js ----
+// Plan footprint and front of a placed model from its extracted shape (tools/extract_models.mjs):
+// info = { min: [x,y,z], max: [x,y,z], front: [fx, fz] | null } in the model's object space. EmuVR keeps the prefab
+// root's own rotation, so both already include it; the room object supplies position, rotation and scale.
+
+const IDENTITY = { x: 0, y: 0, z: 0, w: 1 };
+const MIN_SIZE = 0.1;     // metres: very thin models (cards, cases) still get a clickable footprint
+const MIN_LEVEL = 0.3;    // a front whose floor-plane share is below this points up or down: no dot
+const scaleOf = (s) => (Number.isFinite(s) ? [s, s, s]
+  : s && typeof s === 'object' ? ['x', 'y', 'z'].map(k => (Number.isFinite(s[k]) ? s[k] : 1)) : [1, 1, 1]);
+
+// World floor-plane unit vector the model's front (its screen) faces, or null when unknown or near vertical.
+function modelFront(o, info) {
+  if (!info || !Array.isArray(info.front)) return null;
+  const v = rotateVec(o.rotation || IDENTITY, [info.front[0], 0, info.front[1]]);
+  const h = Math.hypot(v[0], v[2]);
+  return h >= MIN_LEVEL ? [v[0] / h, v[2] / h] : null;
+}
+
+// { corners: 4 [x,z] (0-1 back edge, 2-3 front edge), front: [x,z] | null, frontMid: [x,z] | null, heading: rad | null }
+// The rectangle is aligned with the front so its front edge is where the player stands; null without model bounds.
+function footprint(o, info) {
+  if (!info || !Array.isArray(info.min) || !Array.isArray(info.max)) return null;
+  const q = o.rotation || IDENTITY, [sx, sy, sz] = scaleOf(o.scale ?? 1), p = o.position || { x: 0, z: 0 };
+  const front = modelFront(o, info);
+  let u = front;
+  if (!u) { // no usable front: frame the box on the model's forward axis, or its right axis when forward is vertical
+    for (const axis of [[0, 0, 1], [1, 0, 0]]) {
+      const v = rotateVec(q, axis), h = Math.hypot(v[0], v[2]);
+      if (h >= MIN_LEVEL) { u = [v[0] / h, v[2] / h]; break; }
+    }
+    if (!u) u = [0, 1];
+  }
+  const r = [u[1], -u[0]]; // right of the heading on the floor (heading t: u = (sin t, cos t), r = (cos t, -sin t))
+  let aMin = Infinity, aMax = -Infinity, bMin = Infinity, bMax = -Infinity;
+  for (let i = 0; i < 8; i++) {
+    const c = [(i & 1 ? info.max[0] : info.min[0]) * sx, (i & 2 ? info.max[1] : info.min[1]) * sy, (i & 4 ? info.max[2] : info.min[2]) * sz];
+    const w = rotateVec(q, c);
+    const a = w[0] * u[0] + w[2] * u[1], b = w[0] * r[0] + w[2] * r[1];
+    if (a < aMin) aMin = a; if (a > aMax) aMax = a; if (b < bMin) bMin = b; if (b > bMax) bMax = b;
+  }
+  if (aMax - aMin < MIN_SIZE) { const m = (aMax + aMin) / 2; aMin = m - MIN_SIZE / 2; aMax = m + MIN_SIZE / 2; }
+  if (bMax - bMin < MIN_SIZE) { const m = (bMax + bMin) / 2; bMin = m - MIN_SIZE / 2; bMax = m + MIN_SIZE / 2; }
+  const pt = (a, b) => [p.x + a * u[0] + b * r[0], p.z + a * u[1] + b * r[1]];
+  return {
+    corners: [pt(aMin, bMin), pt(aMin, bMax), pt(aMax, bMax), pt(aMax, bMin)],
+    front,
+    frontMid: front ? pt(aMax, (bMin + bMax) / 2) : null,
+    heading: front ? Math.atan2(front[0], front[1]) + 0 : null,
+  };
+}
+
+// How tall the model stands in VR (metres) at its room scale and rotation; null without model bounds.
+function modelHeight(o, info) {
+  if (!info || !Array.isArray(info.min) || !Array.isArray(info.max)) return null;
+  const q = o.rotation || IDENTITY, [sx, sy, sz] = scaleOf(o.scale ?? 1);
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < 8; i++) {
+    const y = rotateVec(q, [(i & 1 ? info.max[0] : info.min[0]) * sx, (i & 2 ? info.max[1] : info.min[1]) * sy, (i & 4 ? info.max[2] : info.min[2]) * sz])[1];
+    if (y < lo) lo = y; if (y > hi) hi = y;
+  }
+  return hi - lo;
+}
+
+// Heading shown on the plan, dial and degree box (0 = +Z, clockwise towards +X): the way the model's front faces,
+// else the rotation's own heading when the model's front is unknown.
+function displayHeading(o, info) {
+  const f = modelFront(o, info);
+  return f ? Math.atan2(f[0], f[1]) + 0 : planHeading(o.rotation);
+}
+// ---- src/undo.js ----
+class CommandStack {
+  constructor() { this.done = []; this.undone = []; }
+  execute(cmd) { cmd.do(); this.done.push(cmd); this.undone = []; }
+  undo() { const c = this.done.pop(); if (c) { c.undo(); this.undone.push(c); } }
+  redo() { const c = this.undone.pop(); if (c) { c.do(); this.done.push(c); } }
+  get canUndo() { return this.done.length > 0; } get canRedo() { return this.undone.length > 0; }
+}
+// ---- src/roomModel.js ----
+
+// Real rooms keep three object arrays: `objects` = screen scaffold block + decor props, `systems` = cabinets/consoles
+// (everything with a game `path` and/or an `embedded_screen`), `games` = loose cartridges (path + position, no id).
+const ARRAYS = ['objects', 'systems', 'games'];
+const isScaffold = (o) => o && typeof o.embedded_screen === 'number' && o.id === undefined && o.position === undefined;
+const isPlaced = (o) => o && o.position !== undefined;
+const isArcadeModel = (id) => /^ugc_Arcade_/i.test(id || '');
+const finite = (obj, keys) => !!obj && typeof obj === 'object' && keys.every(k => Number.isFinite(obj[k]));
+// EmuVR writes scale either as one number or as a {x,y,z} vector (non-uniform scale); both are valid.
+const scaleOk = (s) => Number.isFinite(s) || finite(s, ['x', 'y', 'z']);
+
+class Room {
+  constructor(raw) {
+    this.raw = raw; this.objects = raw.objects;
+    this.systems = Array.isArray(raw.systems) ? raw.systems : (raw.systems = []);
+    this.games = Array.isArray(raw.games) ? raw.games : []; // never written to; not attached so absent keys stay absent
+    this.unverified = new Set(); this.slot = null;
+  }
+  static parse(text) {
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    const raw = JSON.parse(text);
+    if (!raw || typeof raw !== 'object' || !Array.isArray(raw.objects)) throw new Error('room has no objects array');
+    return new Room(raw);
+  }
+  scaffold() { return this.objects.filter(isScaffold); }
+  all() { return [...this.objects, ...this.systems, ...this.games]; }
+  placed() { return [...this.objects, ...this.systems].filter(isPlaced); } // cartridges in `games` have no id: not editable on the plan
+  homeOf(o) { for (const k of ARRAYS) if (this[k].includes(o)) return k; return null; }
+  maxScreen() { return this.scaffold().reduce((m, o) => Math.max(m, o.embedded_screen), -1); }
+  serialize() { return JSON.stringify(this.raw, null, 2); }
+  setPosition(o, x, y, z) { o.position = { x, y, z }; }
+  // Rotation is composed (world-Y turn applied on top of the existing quaternion) so models authored Z-up keep their X/Z tilt.
+  rotateYaw(o, d) { o.rotation = o.rotation ? qmul(quatFromYaw(d), o.rotation) : quatFromYaw(d); }
+  // Turn so the shown heading becomes `yaw`, composed like rotateYaw. `current` = the heading shown now (the way the
+  // model's front faces, from models\index.json); without it, the rotation's own heading.
+  setYaw(o, yaw, current) {
+    const cur = Number.isFinite(current) ? current : o.rotation ? planHeading(o.rotation) : 0;
+    this.rotateYaw(o, angleDelta(cur, yaw));
+  }
+  setScale(o, s) { o.scale = s; }
+  setGame(o, path) {
+    const next = path || null;
+    if ((o.path || null) !== next) { delete o.crc; delete o.open; } // EmuVR-owned identity of the previous game
+    if (next) { o.path = next; if (isArcadeModel(o.id) && typeof o.embedded_screen !== 'number') this.allocateScreen(o); }
+    else delete o.path;
+  }
+  setModel(o, id, opts = {}) { o.id = id; if (opts.verified) this.unverified.delete(o); else this.unverified.add(o); }
+  setFrozen(o, f) { o.frozen = !!f; }
+  // New scaffold entry MAX+1 goes right after the last scaffold entry; the object gets the same index.
+  allocateScreen(o) {
+    const n = this.maxScreen() + 1;
+    this.objects.splice(this.scaffold().length, 0, { embedded_screen: n });
+    o.embedded_screen = n; return n;
+  }
+  // Take the object's screen away again (undo of an allocation): drop the index and its scaffold entry.
+  releaseScreen(o) {
+    if (typeof o.embedded_screen !== 'number') return;
+    const n = o.embedded_screen; delete o.embedded_screen; this._dropScreen(n);
+  }
+  // Remove screen n's scaffold entry and close the gap so indices stay contiguous 0..MAX-1 (objects AND systems).
+  _dropScreen(n) {
+    const si = this.objects.findIndex(s => isScaffold(s) && s.embedded_screen === n);
+    if (si >= 0) this.objects.splice(si, 1);
+    for (const x of this.all()) if (typeof x.embedded_screen === 'number' && x.embedded_screen > n) x.embedded_screen -= 1;
+  }
+  // screen: allocate an embedded_screen (default: arcade cabinets always, per the library). home: target array
+  // (default: systems for anything with a screen or a game, objects for plain decor).
+  add({ id, path, x, z, y = 0, yaw = 0, scale = 1, screen, home }, opts = {}) {
+    const o = { id, position: { x, y, z }, rotation: quatFromYaw(yaw), scale, frozen: true };
+    if (path) o.path = path;
+    if (screen ?? isArcadeModel(id)) this.allocateScreen(o);
+    const dest = home || ((path || typeof o.embedded_screen === 'number') ? 'systems' : 'objects');
+    this[dest].push(o);
+    if (!opts.verified) this.unverified.add(o);
+    return o;
+  }
+  remove(o) {
+    const home = this.homeOf(o); if (!home) return;
+    this[home].splice(this[home].indexOf(o), 1);
+    this.unverified.delete(o);
+    if (typeof o.embedded_screen === 'number') this._dropScreen(o.embedded_screen); // the removed object keeps its index (undo restores it as-is)
+  }
+  // Undo support for remove(): the arrays (same object references) and every embedded_screen.
+  snapshot() { return { arrays: Object.fromEntries(ARRAYS.map(k => [k, this[k].slice()])), screens: new Map(this.all().map(x => [x, x.embedded_screen])) }; }
+  restore(s) {
+    for (const k of ARRAYS) this[k].splice(0, this[k].length, ...s.arrays[k]);
+    for (const [x, n] of s.screens) if (typeof n === 'number') x.embedded_screen = n; else delete x.embedded_screen;
+  }
+  validate(opts = {}) {
+    const errors = [], warnings = [];
+    const sc = this.scaffold();
+    for (let i = 0; i < sc.length; i++) {
+      if (this.objects[i] !== sc[i] || sc[i].embedded_screen !== i)
+        { errors.push(`scaffold block must be objects[0..${sc.length - 1}] in order (problem at index ${i})`); break; }
+    }
+    const counts = new Map();
+    for (const o of this.all()) if (typeof o.embedded_screen === 'number')
+      counts.set(o.embedded_screen, (counts.get(o.embedded_screen) || 0) + 1);
+    const max = this.maxScreen();
+    for (let i = 0; i <= max; i++) {
+      const c = counts.get(i) || 0;
+      if (c !== 2) errors.push(`screen ${i} appears ${c === 1 ? 'once' : c + ' times'} (must be exactly twice)`);
+    }
+    for (const [k] of counts) if (k > max) errors.push(`screen ${k} has no scaffold entry`);
+    let noFrozen = 0;
+    for (const o of this.placed()) {
+      if (!o.id) errors.push('placed object missing id');
+      if (!o.rotation) errors.push(`object ${o.id} missing rotation`);
+      else if (!finite(o.rotation, ['x', 'y', 'z', 'w'])) errors.push(`object ${o.id} rotation is not numeric`);
+      if (!finite(o.position, ['x', 'y', 'z'])) errors.push(`object ${o.id} position is not numeric`);
+      if (o.scale !== undefined && !scaleOk(o.scale)) errors.push(`object ${o.id} scale is not numeric`);
+      if (typeof o.frozen !== 'boolean') noFrozen++; // EmuVR writes and loads such objects fine; left untouched
+      if (o.path && isArcadeModel(o.id) && typeof o.embedded_screen !== 'number') errors.push(`cabinet ${o.id} has a game but no embedded_screen`);
+    }
+    if (noFrozen) warnings.push(`${noFrozen} object(s) have no frozen flag (left as-is)`);
+    const seen = new Map();
+    for (const o of this.placed()) if (o.path) {
+      const k = o.path.toLowerCase();
+      if (seen.has(k)) warnings.push(`duplicate game: ${o.path}`); else seen.set(k, o);
+      if (opts.launchability && opts.launchability(o.path) === 'dead') warnings.push(`dead game: ${o.path}`);
+    }
+    if (opts.unverified) for (const o of opts.unverified) warnings.push(`unverified size: ${o.id}`);
+    return { errors, warnings };
+  }
+}
+// ---- src/catalog.js ----
+function normalizeName(s) {
+  return String(s).replace(/^Arcade_/i, '').replace(/_[0-9a-f]{8}$/i, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+function parseTpGamePath(xml) {
+  const m = /<GamePath>([\s\S]*?)<\/GamePath>/.exec(xml || '');
+  return m ? m[1].trim() : '';
+}
+const base = (f) => f.replace(/\.[^.]+$/, '');
+function buildCatalog(l) {
+  const models = (l.ugcNames || []).map(n => ({ id: 'ugc_' + n, name: n, key: normalizeName(n) }));
+  const games = [];
+  for (const [system, files] of Object.entries(l.gameFiles || {}))
+    for (const file of files) games.push({ path: `Games\\${system}\\${file}`, system, file, key: normalizeName(base(file)) });
+  const tpProfiles = new Map(Object.entries(l.tpProfiles || {}).map(([n, x]) => [n, { gamePath: parseTpGamePath(x) }]));
+  const lowerBase = (a) => new Set((a || []).map(x => base(x).toLowerCase()));
+  return {
+    models, games,
+    winTexts: new Map(Object.entries(l.winTexts || {})),
+    tpProfiles,
+    m2Roms: lowerBase(l.m2Roms), m3Roms: lowerBase(l.m3Roms),
+    videos: new Set((l.videoNames || []).map(v => v.toLowerCase())),
+    // Daphne framefiles relative to Emulators\Daphne (e.g. vldp\drugwars\drugwars.txt); null = listing unavailable -> unknown
+    daphneFrames: l.daphneFrames ? new Set(l.daphneFrames.map(p => p.replace(/\//g, '\\').replace(/^\.?\\/, '').toLowerCase())) : null,
+    // true / false / null (null = not verifiable from here -> unknown)
+    tpGamePathExists: l.tpGamePathExists || (() => true),
+    fileExists: l.fileExists || (() => true),
+  };
+}
+// ---- src/linking.js ----
+const baseOf = (p) => p.split('\\').pop().replace(/\.[^.]+$/, '');
+
+function launchability(path, c) {
+  // EmuVR names a game inside an archive as "<archive>.zip#<member>"; the file on disk is the archive.
+  if (!c.fileExists(path.split('#')[0])) return { status: 'dead', reason: 'file not found' };
+  if (!/\.win$/i.test(path)) return { status: 'live', reason: 'file present' };
+  const w = c.winTexts.get(path) || '';
+  let m;
+  if ((m = /--profile=([^\s"]+)\.xml/.exec(w))) {
+    const prof = c.tpProfiles.get(m[1]);
+    if (!prof) return { status: 'dead', reason: `TeknoParrot profile ${m[1]}.xml missing` };
+    if (!prof.gamePath) return { status: 'dead', reason: 'TeknoParrot game location not set' };
+    const ok = c.tpGamePathExists(prof.gamePath);
+    if (ok === false) return { status: 'dead', reason: 'TeknoParrot game file missing' };
+    if (ok === null || ok === undefined) return { status: 'unknown', reason: 'TeknoParrot game file not verifiable from the browser' };
+    return { status: 'live', reason: `TeknoParrot ${m[1]}` };
+  }
+  if ((m = /emulator_multicpu\.exe\s+(\w+)/i.exec(w))) return c.m2Roms.has(m[1].toLowerCase()) ? { status: 'live', reason: 'Model2 rom owned' } : { status: 'dead', reason: `Model2 rom ${m[1]} not owned` };
+  if ((m = /supermodel.*roms\\(\w+)\.zip/i.exec(w))) return c.m3Roms.has(m[1].toLowerCase()) ? { status: 'live', reason: 'Model3 rom owned' } : { status: 'dead', reason: `Model3 rom ${m[1]} not owned` };
+  if (/daphne/i.test(w)) {
+    const f = /-framefile\s+"?([^"\s]+)/i.exec(w);
+    if (!f) return { status: 'unknown', reason: 'Daphne launcher has no -framefile' };
+    if (!c.daphneFrames) return { status: 'unknown', reason: 'Daphne framefile not verifiable (no listing)' };
+    const rel = f[1].replace(/\//g, '\\').replace(/^\.?\\/, '');
+    return c.daphneFrames.has(rel.toLowerCase()) ? { status: 'live', reason: 'Daphne framefile present' } : { status: 'dead', reason: `Daphne framefile ${rel} missing` };
+  }
+  return { status: 'unknown', reason: 'launcher type not recognised' };
+}
+function launchableGames(c, { includeUnknown = false } = {}) {
+  return c.games.filter(g => { const s = launchability(g.path, c).status; return s === 'live' || (includeUnknown && s === 'unknown'); });
+}
+// Keys are compared both as-is and with spaces removed so that "pac man" (model) matches "pacman" (rom file).
+const squash = (s) => s.replace(/\s+/g, '');
+const score = (a, b) => {
+  if (!a || !b) return 0;
+  if (a === b) return 3;
+  const sa = squash(a), sb = squash(b);
+  if (sa === sb) return 3;
+  if (a.startsWith(b) || b.startsWith(a) || sa.startsWith(sb) || sb.startsWith(sa)) return 2;
+  const ta = new Set(a.split(' '));
+  return b.split(' ').some(t => ta.has(t)) ? 1 : 0;
+};
+function suggestGamesForModel(modelId, c) {
+  const k = normalizeName(modelId.replace(/^ugc_/, ''));
+  return c.games.map(g => [score(g.key, k), g]).filter(x => x[0] > 0).sort((a, b) => b[0] - a[0]).map(x => x[1]);
+}
+function suggestModelsForGame(path, c) {
+  const k = normalizeName(baseOf(path));
+  return c.models.map(m => [score(m.key, k), m]).filter(x => x[0] > 0).sort((a, b) => b[0] - a[0]).map(x => x[1]);
+}
+function hasAttractVideo(path, c) { return c.videos.has(baseOf(path).toLowerCase()); }
+// ---- src/hints.js ----
+function buildHints(rooms, { excludeSlot } = {}) {
+  const map = new Map();
+  for (const r of rooms) {
+    if (r.slot === excludeSlot) continue;
+    let raw; try { raw = JSON.parse(r.text.charCodeAt(0) === 0xfeff ? r.text.slice(1) : r.text); } catch { continue; }
+    // cabinets live in `systems`, decor in `objects`, cartridges in `games`
+    for (const o of [...(raw.objects || []), ...(raw.systems || []), ...(raw.games || [])]) {
+      if (!o.id || !o.position) continue;
+      // a {x,y,z} vector scale contributes its uniform part (x), as the panel's slider does
+      const s = typeof o.scale === 'number' ? o.scale : (o.scale && Number.isFinite(o.scale.x) ? o.scale.x : 1);
+      if (!map.has(o.id)) map.set(o.id, []);
+      map.get(o.id).push({ slot: r.slot, scale: s });
+    }
+  }
+  return map;
+}
+function hintFor(id, hints) {
+  const samples = hints.get(id); if (!samples || !samples.length) return null;
+  const s = samples.map(x => x.scale).sort((a, b) => a - b);
+  return { median: s[Math.floor(s.length / 2)], samples };
+}
+// ---- src/walls.js ----
+// Pure walls model: level outline placement, the level-outline gate and the user's traced walls (no DOM, no file I/O).
+
+const LEVEL_RE = /^ugc_Level_/i; // fallback only, for callers that have no set of level bundle ids
+
+function levelObjects(room) {
+  if (!room) return [];
+  const objs = Array.isArray(room.objects) ? room.objects : [];
+  const sys = Array.isArray(room.systems) ? room.systems : [];
+  return [...objs, ...sys];
+}
+
+// "<Name>_<8 hex>" prefix of a Custom\UGC\Levels bundle file name -> the room object id ("ugc_<Name>_<hash>").
+// Lazy on purpose: the "_[temp_level_stopgap_1234578a]" suffix also ends in 8 hex digits.
+function levelIdFromFile(file) {
+  const m = /^(.*?_[0-9a-f]{8})(?![0-9A-Za-z])/.exec(String(file).split(/[\\/]/).pop());
+  return m ? 'ugc_' + m[1] : null;
+}
+
+// Room objects (objects[] then systems[]) whose id is in `levelIds`, first occurrence of each id, in room order.
+// The Levels folder also holds props (screens, shelves), so callers must still check each candidate's cache.
+function levelCandidates(room, levelIds) {
+  const seen = new Set(), out = [];
+  for (const o of levelObjects(room)) {
+    if (o && typeof o.id === 'string' && levelIds.has(o.id) && !seen.has(o.id)) { seen.add(o.id); out.push(o); }
+  }
+  return out;
+}
+
+// The room's level model: the first object whose id is in `levelIds` (a Set of level bundle ids); without a set,
+// the first id starting with ugc_Level_. Searched in objects then systems.
+function levelObjectOf(room, levelIds) {
+  if (levelIds) return levelCandidates(room, levelIds)[0] || null;
+  return levelObjects(room).find(o => o && typeof o.id === 'string' && LEVEL_RE.test(o.id)) || null;
+}
+function levelIdOf(room, levelIds) {
+  const o = levelObjectOf(room, levelIds);
+  return o ? o.id : null;
+}
+
+// "ugc_Level_Entertainment_Arcade_9e2f95d3" -> "Entertainment Arcade".
+function levelDisplayName(id) {
+  return String(id).replace(/^ugc_(Level_)?/i, '').replace(/_[0-9a-f]{8}$/i, '').replace(/_/g, ' ');
+}
+
+// ---- Which level outlines may be drawn (shared by tools/extract_walls.mjs and the app). ----
+// A count of cabinets "inside" an outline cannot judge it: the outline is a slice through thick, often open collider
+// geometry, and on the real rooms every inside test tried (even-odd on one or four rays, flood-filled enclosure)
+// scored correct outlines low and mirrored ones high. Alignment is reviewed by eye with tools/render_walls.mjs, and
+// tests/unity_gate.test.js checks Slot 6 against displaced copies. Drawing needs a sane outline and a placement the
+// 2D plan can show faithfully.
+
+const MIN_SEGMENTS = 4;
+const MIN_SPAN = 5; // metres, on both axes
+
+// EmuVR's level conversion names level bundles "<Name>_<8 hex>_[temp_level_stopgap_...].ugc"; props kept in the same
+// Custom\UGC\Levels folder (Blockbuster screens and shelves) have no stopgap suffix.
+function isLevelBundleFile(file) {
+  return /\[temp_level_stopgap_[0-9a-f]+\]\.ugc$/i.test(String(file)) && levelIdFromFile(file) !== null;
+}
+
+function outlineCheck(outline) {
+  const segments = (outline && Array.isArray(outline.segments)) ? outline.segments : [];
+  const reasons = [];
+  if (segments.length < MIN_SEGMENTS) reasons.push(`${segments.length} segments < ${MIN_SEGMENTS}`);
+  const b = wallBounds([segments]);
+  if (!b || b.maxX - b.minX < MIN_SPAN || b.maxZ - b.minZ < MIN_SPAN) reasons.push(`outline spans less than ${MIN_SPAN} m`);
+  return { ok: reasons.length === 0, reasons };
+}
+
+const scaleIsOne = (s) => s === undefined || s === null ||
+  (Number.isFinite(s) ? Math.abs(s - 1) <= 1e-6 : typeof s === 'object' && ['x', 'y', 'z'].every(k => Number.isFinite(s[k]) && Math.abs(s[k] - 1) <= 1e-6));
+const rotationIsYaw = (q) => !q || (Math.abs(q.x || 0) <= 1e-3 && Math.abs(q.z || 0) <= 1e-3);
+
+// The level object's own placement: a scaled level (Blockbuster in Slot 10 is at scale 75) or a tilted one cannot be
+// drawn as a floor plan that matches what EmuVR shows, so it is reported instead.
+function placementCheck(levelObj) {
+  const lo = levelObj || {};
+  const reasons = [];
+  if (!scaleIsOne(lo.scale)) reasons.push(`level is scaled ${Number.isFinite(lo.scale) ? 'x' + lo.scale : JSON.stringify(lo.scale)} in this room`);
+  if (!rotationIsYaw(lo.rotation)) reasons.push('level is tilted in this room');
+  return { ok: reasons.length === 0, reasons };
+}
+
+// Whether a level cache may be drawn for the room object `levelObj` that places it.
+function levelWallsFit(json, levelObj) {
+  if (!json || !Array.isArray(json.segments)) return { ok: false, reason: 'level outline cache is unreadable' };
+  const o = outlineCheck(json);
+  if (!o.ok) return { ok: false, reason: 'level outline cache is too small' };
+  const p = placementCheck(levelObj);
+  if (!p.ok) return { ok: false, reason: p.reasons[0] };
+  return { ok: true, reason: null };
+}
+
+// Level-local segments [x1,z1,x2,z2] -> room space: scale, then yaw (Unity Y-up, forward = (sin t, cos t)), then position.
+// Missing position/rotation/scale are identity. A vector scale uses its x and z components.
+function transformOutline(segments, levelObj) {
+  const lo = levelObj || {};
+  const p = lo.position || {};
+  const px = Number.isFinite(p.x) ? p.x : 0, pz = Number.isFinite(p.z) ? p.z : 0;
+  let sx = 1, sz = 1;
+  if (Number.isFinite(lo.scale)) { sx = sz = lo.scale; }
+  else if (lo.scale && typeof lo.scale === 'object') {
+    sx = Number.isFinite(lo.scale.x) ? lo.scale.x : 1;
+    sz = Number.isFinite(lo.scale.z) ? lo.scale.z : 1;
+  }
+  const t = lo.rotation ? headingOf(lo.rotation) : 0;
+  const c = Math.cos(t), s = Math.sin(t);
+  const map = (x, z) => {
+    const lx = x * sx, lz = z * sz;
+    return [px + lx * c + lz * s, pz - lx * s + lz * c];
+  };
+  return (segments || []).map(([x1, z1, x2, z2]) => [...map(x1, z1), ...map(x2, z2)]);
+}
+
+// Bounds over a list of segment arrays (null/empty entries ignored); null when there are no segments.
+function wallBounds(segmentsList) {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const segs of segmentsList || []) {
+    for (const seg of segs || []) {
+      const [x1, z1, x2, z2] = seg;
+      for (const [x, z] of [[x1, z1], [x2, z2]]) {
+        if (!Number.isFinite(x) || !Number.isFinite(z)) continue;
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+      }
+    }
+  }
+  return minX === Infinity ? null : { minX, maxX, minZ, maxZ };
+}
+
+// ---- Traced walls. A trace is { runs: [[[x,z],...], ...], current: [[x,z],...] }; every op returns a new trace. ----
+
+function emptyTrace() { return { runs: [], current: [] }; }
+
+const snapTo = (v, step) => {
+  if (!(step > 0)) return v + 0;
+  return Number((Math.round(v / step) * step).toFixed(10)) + 0; // toFixed strips float noise like 5.000000000000001
+};
+
+// Add a corner snapped to `snap` metres; axisLock keeps it horizontal or vertical from the previous corner.
+function addCorner(trace, x, z, { snap = 0.1, axisLock = false } = {}) {
+  const cur = trace.current || [];
+  let nx = snapTo(x, snap), nz = snapTo(z, snap);
+  if (axisLock && cur.length) {
+    const [lx, lz] = cur[cur.length - 1];
+    if (Math.abs(x - lx) >= Math.abs(z - lz)) nz = lz; else nx = lx;
+  }
+  return { runs: trace.runs || [], current: [...cur, [nx, nz]] };
+}
+
+// Finish the in-progress run as drawn (open-ended; no segment back to the first corner). Runs of < 2 corners are dropped.
+function closeRun(trace) {
+  const cur = trace.current || [];
+  const runs = trace.runs || [];
+  return { runs: cur.length >= 2 ? [...runs, cur] : runs, current: [] };
+}
+
+function removeLastCorner(trace) {
+  return { runs: trace.runs || [], current: (trace.current || []).slice(0, -1) };
+}
+
+const runSegments = (run) => {
+  const out = [];
+  for (let i = 1; i < run.length; i++) out.push([run[i - 1][0], run[i - 1][1], run[i][0], run[i][1]]);
+  return out;
+};
+
+// Segments of the finished runs only; the in-progress run (trace.current) is drawn separately by the plan.
+function traceSegments(trace) {
+  return (trace && trace.runs ? trace.runs : []).flatMap(runSegments);
+}
+
+// File format: { "slot", "runs": [[[x,z],...], ...] }. An unfinished run with >= 2 corners is saved as a run too.
+function serializeTrace(slot, trace) {
+  const runs = [...(trace.runs || [])];
+  if (trace.current && trace.current.length >= 2) runs.push(trace.current);
+  return JSON.stringify({ slot, runs });
+}
+
+function parseTrace(text) {
+  if (typeof text === 'string' && text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const raw = JSON.parse(text);
+  const runs = (raw && Array.isArray(raw.runs) ? raw.runs : [])
+    .filter(Array.isArray)
+    .map(run => run.filter(p => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1])).map(([x, z]) => [x, z]))
+    .filter(run => run.length >= 2);
+  return { runs, current: [] };
+}
+// ---- src/fs.js ----
+function createFs() {
+  const fsa = typeof window !== 'undefined' && 'showDirectoryPicker' in window;
+  let root = null;
+  const parts = (rel) => rel.split('\\').filter(Boolean);
+  async function dirHandle(rel, create = false) {
+    let h = root; for (const p of parts(rel)) h = await h.getDirectoryHandle(p, { create }); return h;
+  }
+  async function fileHandle(rel, create = false) {
+    const ps = parts(rel); const name = ps.pop(); const d = await dirHandle(ps.join('\\'), create);
+    return d.getFileHandle(name, { create });
+  }
+  return {
+    mode: fsa ? 'fsa' : 'fallback',
+    get rootName() { return root ? root.name : null; },
+    async pickRoot() { root = await window.showDirectoryPicker({ mode: 'readwrite' }); },
+    async readText(rel) { const f = await (await fileHandle(rel)).getFile(); return f.text(); },
+    // probe: also open each file (metadata only) and drop the ones that fail - a dangling symlink is listed by the
+    // directory but cannot be opened, and must not be reported as a present game.
+    async listDir(rel, { probe = false } = {}) {
+      const d = await dirHandle(rel); const files = [], dirs = [];
+      for await (const [name, h] of d.entries()) {
+        if (h.kind !== 'file') { dirs.push(name); continue; }
+        if (probe) { try { await h.getFile(); } catch { continue; } }
+        files.push(name);
+      }
+      return { files, dirs };
+    },
+    async exists(rel) { try { await fileHandle(rel); return true; } catch { try { await dirHandle(rel); return true; } catch { return false; } } },
+    async writeText(rel, text) {
+      const h = await fileHandle(rel, true); const w = await h.createWritable();
+      await w.write(new TextEncoder().encode(text)); await w.close(); // TextEncoder emits no BOM
+    },
+    loadRoomViaInput(file) { return file.text(); },
+    download(name, text) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' })); a.download = name; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    },
+  };
+}
+// ---- src/plan.js ----
+
+const TRACE_HINT = 'TRACE: click corners, Shift = straight, Enter/double-click = finish run, Backspace = undo corner, Esc = exit';
+
+function createPlan(canvas, room, deps) {
+  const ctx = canvas.getContext('2d');
+  const st = { room, camX: 0, camZ: 0, zoom: 30, selection: new Set(), addMode: false, drag: null, hover: null,
+    level: null, trace: emptyTrace(), traceMode: false, pointer: null };
+  const view = () => planView({ camX: st.camX, camZ: st.camZ, zoom: st.zoom, width: canvas.width, height: canvas.height }); // +Z up, as seen from above
+  const toScreen = (x, z) => view().toScreen(x, z);
+  const toWorld = (sx, sz) => view().toWorld(sx, sz);
+  // Footprint from the model's extracted bounds, aligned with the way its screen faces (white dot = front). Models with
+  // no entry in models\index.json fall back to a guessed box on their rotation, with no front dot.
+  const shape = (o) => {
+    const fp = footprint(o, deps.modelInfo ? deps.modelInfo(o.id) : null);
+    if (fp) return fp;
+    const { w, d } = footprintSize(o.id, o.scale ?? 1);
+    return { corners: obbCorners(o.position.x, o.position.z, planHeading(o.rotation), w, d), frontMid: null };
+  };
+  const geom = (o) => shape(o).corners;
+  const colors = { live: '#3fb950', dead: '#f85149', unknown: '#8b949e', decor: '#6e7681' };
+  const traceChanged = () => { if (deps.onTraceChange) deps.onTraceChange(st.trace); render(); };
+  const lastCorner = () => st.trace.current.length ? st.trace.current[st.trace.current.length - 1] : null;
+
+  function fitToRoom() {
+    const ps = st.room.placed();
+    const xs = ps.map(o => o.position.x), zs = ps.map(o => o.position.z);
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    if (ps.length) { minX = Math.min(...xs) - 3; maxX = Math.max(...xs) + 3; minZ = Math.min(...zs) - 3; maxZ = Math.max(...zs) + 3; }
+    const wb = wallBounds([st.level, traceSegments(st.trace), st.trace.current.map(([x, z]) => [x, z, x, z])]);
+    if (wb) { minX = Math.min(minX, wb.minX - 1); maxX = Math.max(maxX, wb.maxX + 1); minZ = Math.min(minZ, wb.minZ - 1); maxZ = Math.max(maxZ, wb.maxZ + 1); }
+    if (minX === Infinity) return;
+    st.camX = (minX + maxX) / 2; st.camZ = (minZ + maxZ) / 2;
+    st.zoom = Math.min(canvas.width / Math.max(maxX - minX, 1e-6), canvas.height / Math.max(maxZ - minZ, 1e-6));
+  }
+  function strokeSegments(segs) {
+    ctx.beginPath();
+    for (const [x1, z1, x2, z2] of segs) { const [a, b] = toScreen(x1, z1), [c, d] = toScreen(x2, z2); ctx.moveTo(a, b); ctx.lineTo(c, d); }
+    ctx.stroke();
+  }
+  function drawWalls() {
+    if (st.level && st.level.length) { ctx.setLineDash([]); ctx.lineWidth = 3; ctx.strokeStyle = '#8b949e'; strokeSegments(st.level); }
+    const runs = [...st.trace.runs, st.trace.current];
+    const segs = traceSegments({ runs });
+    ctx.lineWidth = 2; ctx.strokeStyle = '#58a6ff'; ctx.setLineDash([6, 4]);
+    if (segs.length) strokeSegments(segs);
+    const last = lastCorner();
+    if (st.traceMode && last && st.pointer) { // rubber band from the last corner to the (snapped, optionally axis-locked) pointer
+      const [px, pz] = toWorld(st.pointer.sx, st.pointer.sz);
+      const p = addCorner({ runs: [], current: [last] }, px, pz, { axisLock: st.pointer.shift }).current[1];
+      strokeSegments([[last[0], last[1], p[0], p[1]]]);
+    }
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#58a6ff';
+    for (const run of runs) for (const [x, z] of run) { const [sx, sz] = toScreen(x, z); ctx.beginPath(); ctx.arc(sx, sz, 2.5, 0, Math.PI * 2); ctx.fill(); }
+  }
+  function render() {
+    const W = canvas.width, H = canvas.height; ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+    const [x0, z0] = toWorld(0, 0), [x1, z1] = toWorld(W, H);
+    for (let gx = Math.floor(x0); gx <= x1; gx++) { const [sx] = toScreen(gx, 0); ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); ctx.stroke(); }
+    for (let gz = Math.floor(Math.min(z0, z1)); gz <= Math.max(z0, z1); gz++) { const [, sz] = toScreen(0, gz); ctx.beginPath(); ctx.moveTo(0, sz); ctx.lineTo(W, sz); ctx.stroke(); }
+    drawWalls();
+    const placed = st.room.placed(); const boxes = placed.map(o => { const s = shape(o); return [o, s.corners, s.frontMid]; });
+    for (const [o, k, frontMid] of boxes) {
+      const overlap = boxes.some(([p, kk]) => p !== o && obbOverlap(k, kk));
+      ctx.beginPath(); k.forEach(([x, z], i) => { const [sx, sz] = toScreen(x, z); i ? ctx.lineTo(sx, sz) : ctx.moveTo(sx, sz); }); ctx.closePath();
+      ctx.fillStyle = colors[deps.badge(o)] + '55'; ctx.fill();
+      ctx.lineWidth = st.selection.has(o) ? 3 : 1.5; ctx.strokeStyle = st.selection.has(o) ? '#58a6ff' : (overlap ? '#d29922' : colors[deps.badge(o)]); ctx.stroke();
+      if (frontMid) { const [sfx, sfz] = toScreen(frontMid[0], frontMid[1]); ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(sfx, sfz, 3.5, 0, Math.PI * 2); ctx.fill(); } // front = the side the screen faces
+      else { const [scx, scz] = toScreen(o.position.x, o.position.z); ctx.strokeStyle = '#8b949e'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(scx, scz, 3, 0, Math.PI * 2); ctx.stroke(); } // front unknown
+      if (st.zoom > 18) { const [sx, sz] = toScreen(o.position.x, o.position.z); ctx.fillStyle = '#c9d1d9'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
+        ctx.fillText(deps.modelName(o.id).slice(0, 22), sx, sz + 4); }
+    }
+    ctx.fillStyle = '#8b949e'; ctx.font = '12px system-ui'; ctx.textAlign = 'left';
+    ctx.fillText(st.traceMode ? TRACE_HINT : st.addMode ? 'ADD MODE: click to place' : 'white dot = front (screen side) | drag empty = pan, wheel = zoom, drag object = move, R/Shift+R rotate 90, [ ] rotate 5', 10, H - 10);
+  }
+  function hit(sx, sz) { const [x, z] = toWorld(sx, sz); const ps = st.room.placed(); for (let i = ps.length - 1; i >= 0; i--) if (pointInObb(x, z, geom(ps[i]))) return ps[i]; return null; }
+  function setTraceMode(on) {
+    on = !!on; if (on === st.traceMode) return;
+    st.traceMode = on; st.drag = null;
+    if (!on && st.trace.current.length) { st.trace = closeRun(st.trace); if (deps.onTraceChange) deps.onTraceChange(st.trace); }
+    render();
+  }
+  canvas.addEventListener('mousedown', (e) => {
+    const r = canvas.getBoundingClientRect(); const sx = e.clientX - r.left, sz = e.clientY - r.top;
+    if (st.traceMode) {
+      if (e.button !== undefined && e.button !== 0) { st.drag = { kind: 'pan', sx, sz }; return; } // non-left buttons still pan
+      if (e.detail >= 2) return; // 2nd press of a double-click: the dblclick that follows closes the run
+      const [x, z] = toWorld(sx, sz);
+      const next = addCorner(st.trace, x, z, { axisLock: e.shiftKey });
+      const prev = lastCorner(), added = next.current[next.current.length - 1];
+      if (prev && prev[0] === added[0] && prev[1] === added[1]) return; // same snapped point (e.g. 2nd click of a double-click)
+      st.trace = next; st.pointer = { sx, sz, shift: e.shiftKey }; traceChanged(); return;
+    }
+    if (st.addMode) { const [x, z] = toWorld(sx, sz); deps.onPlaceClick(x, z); return; }
+    const o = hit(sx, sz);
+    if (o) { if (!e.shiftKey && !st.selection.has(o)) st.selection.clear(); st.selection.add(o); deps.onSelect([...st.selection]); st.drag = { kind: 'move', sx, sz, moved: false }; }
+    else { if (!e.shiftKey) { st.selection.clear(); deps.onSelect([]); } st.drag = { kind: 'pan', sx, sz }; }
+    render();
+  });
+  canvas.addEventListener('dblclick', (e) => { if (!st.traceMode) return; if (e.preventDefault) e.preventDefault(); st.trace = closeRun(st.trace); traceChanged(); });
+  canvas.addEventListener('contextmenu', (e) => { if (st.traceMode && e.preventDefault) e.preventDefault(); });
+  canvas.addEventListener('mouseleave', () => { if (st.traceMode && st.pointer) { st.pointer = null; render(); } });
+  canvas.addEventListener('mousemove', (e) => {
+    const r = canvas.getBoundingClientRect(); const sx = e.clientX - r.left, sz = e.clientY - r.top;
+    if (st.traceMode) { st.pointer = { sx, sz, shift: e.shiftKey }; if (!st.drag) return render(); }
+    if (!st.drag) return;
+    const dx = (sx - st.drag.sx) / st.zoom, dz = -(sz - st.drag.sz) / st.zoom; // world deltas: screen down = -Z
+    if (st.drag.kind === 'pan') { st.camX -= dx; st.camZ -= dz; }
+    else { const snap = e.altKey ? 1e-9 : 0.1; const qx = Math.round(dx / snap) * snap, qz = Math.round(dz / snap) * snap; if (qx || qz) { deps.onMove([...st.selection], qx, qz); st.drag.moved = true; st.drag.sx += qx * st.zoom; st.drag.sz -= qz * st.zoom; return render(); } return; }
+    st.drag.sx = sx; st.drag.sz = sz; render();
+  });
+  window.addEventListener('mouseup', () => { st.drag = null; });
+  canvas.addEventListener('wheel', (e) => { e.preventDefault(); st.zoom = Math.max(4, Math.min(200, st.zoom * (e.deltaY < 0 ? 1.1 : 0.9))); render(); }, { passive: false });
+  window.addEventListener('keydown', (e) => {
+    if (deps.busy && deps.busy()) return; // a panel slider/dial drag is in progress: its object must not change underneath it
+    const tag = e.target && e.target.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    if (st.traceMode) {
+      if (e.key === 'Enter') { e.preventDefault(); st.trace = closeRun(st.trace); traceChanged(); }
+      else if (e.key === 'Backspace') { e.preventDefault(); if (st.trace.current.length) { st.trace = removeLastCorner(st.trace); traceChanged(); } }
+      else if (e.key === 'Escape') { e.preventDefault(); setTraceMode(false); }
+      else if (e.key === 'Shift' && st.pointer) { st.pointer.shift = true; render(); }
+      return;
+    }
+    const sel = [...st.selection]; if (!sel.length) return;
+    if (e.key === 'r' || e.key === 'R') deps.onRotate(sel, (e.shiftKey ? -1 : 1) * Math.PI / 2);
+    else if (e.key === '[') deps.onRotate(sel, -Math.PI / 36); else if (e.key === ']') deps.onRotate(sel, Math.PI / 36);
+    else return; render();
+  });
+  window.addEventListener('keyup', (e) => { if (st.traceMode && e.key === 'Shift' && st.pointer) { st.pointer.shift = false; render(); } });
+  return {
+    render, fitToRoom,
+    get selection() { return st.selection; },
+    setRoom(r) { st.room = r; st.selection.clear(); },
+    setAddMode(b) { st.addMode = b; render(); },
+    setWalls({ level = null, traced = null } = {}) { st.level = level && level.length ? level : null; st.trace = traced ? { runs: traced.runs || [], current: traced.current || [] } : emptyTrace(); render(); },
+    setTraceMode,
+    get traceMode() { return st.traceMode; },
+  };
+}
+// ---- src/panel.js ----
+
+// Slider/dial CSS is injected at runtime (index.html is owned by the app wiring task).
+const PANEL_CSS = `
+#panel .pc-row{display:flex;align-items:center;gap:8px;margin:4px 0}
+#panel .pc-track{position:relative;flex:1;min-width:0;margin:0}
+#panel .pc-track input[type=range]{width:100%;margin:0;display:block}
+#panel .pc-tick{position:absolute;top:-3px;width:2px;height:6px;margin:0;background:#d29922;transform:translateX(-50%);pointer-events:none}
+#panel .pc-row input[type=number]{width:6em}
+#panel canvas.dial{width:120px;height:120px;flex:none;cursor:grab;touch-action:none}
+#panel canvas.dial.dragging{cursor:grabbing}
+`;
+function injectPanelCss() {
+  if (typeof document === 'undefined' || document.getElementById('panel-controls')) return;
+  const style = document.createElement('style'); style.id = 'panel-controls'; style.textContent = PANEL_CSS;
+  document.head.append(style);
+}
+const copyScale = (s) => (s && typeof s === 'object' ? { ...s } : s);
+const uniformOf = (s) => (typeof s === 'number' ? s : s && typeof s === 'object' && Number.isFinite(s.x) ? s.x : 1);
+// The plan is a true top-down view: +X to the right and +Z UP the screen. A heading t (0 = +Z, clockwise towards +X)
+// therefore points to the same screen angle pointerToAngle measures (0 = up, clockwise), so the dial matches the plan.
+const DIAL = 120, SNAP_DEG = 15;
+const headingToScreenAngle = (t) => angleDelta(0, t);
+const screenAngleToHeading = (a) => angleDelta(0, a);
+
+function createPanel(el, deps) {
+  injectPanelCss();
+  const h = (tag, attrs = {}, ...kids) => { const e = document.createElement(tag); Object.assign(e, attrs); kids.forEach(k => e.append(k)); return e; };
+  const preview = () => { if (deps.preview) deps.preview(); };
+  const fmt = (v) => String(Number(v.toPrecision(6)));
+  // Cancel function of the slider/dial drag in progress (null when none): the plan ignores keys while it is set, and
+  // a panel rebuild puts the object back to its pre-drag value instead of stranding a half-changed preview.
+  let activeDrag = null;
+  // Logarithmic scale bar: centre = hint median (else current scale), covering centre/100 .. centre*100.
+  function scaleControl(o, room, hint) {
+    const cur = uniformOf(o.scale);
+    const centre = hint && hint.median > 0 ? hint.median : cur > 0 ? cur : 1;
+    const range = h('input', { type: 'range', min: 0, max: 1000, step: 'any', value: scaleToSlider(cur, centre) });
+    const track = h('div', { className: 'pc-track' }, range);
+    if (hint && hint.median > 0) {
+      const pct = scaleToSlider(hint.median, centre) / 10;
+      const tick = h('div', { className: 'pc-tick', title: 'known size ' + hint.median });
+      // the thumb centre travels 8px .. (100% - 8px): left = 8px + pct% * (100% - 16px)
+      tick.style.left = `calc(${pct}% + ${8 - 0.16 * pct}px)`;
+      track.append(tick);
+    }
+    const num = h('input', { type: 'number', step: 'any', value: fmt(cur) });
+    let start = null; // scale at drag start (plain copy), null when not dragging
+    const scaleFor = (base, target) => {
+      const u = uniformOf(base);
+      if (base === undefined || typeof base === 'number' || !(u > 0)) return typeof base === 'object' && base ? { x: target, y: target, z: target } : target;
+      return uniformScale(base, target / u);
+    };
+    const commit = (before, after) => deps.onChange({ label: 'scale', do: () => room.setScale(o, copyScale(after)),
+      undo: () => { if (before === undefined) delete o.scale; else room.setScale(o, copyScale(before)); } });
+    const restoreScale = (v) => { if (v === undefined) delete o.scale; else o.scale = copyScale(v); };
+    const cancel = () => { if (start !== null) { restoreScale(start.v); start = null; } };
+    const begin = () => { if (start === null) start = { v: copyScale(o.scale) }; activeDrag = cancel; };
+    // Commit on release, not only on 'change': a range fires no 'change' when the thumb is released at the value it
+    // was pressed at (e.g. pinned at an end), although 'input' already changed o.scale.
+    const commitDrag = () => {
+      if (activeDrag === cancel) activeDrag = null;
+      if (start === null) return;
+      const before = start.v, after = copyScale(o.scale); start = null;
+      if (JSON.stringify(before) === JSON.stringify(after)) return;
+      restoreScale(before);
+      commit(before, after);
+    };
+    range.addEventListener('pointerdown', () => {
+      begin();
+      window.addEventListener('pointerup', commitDrag, { once: true });
+      window.addEventListener('pointercancel', commitDrag, { once: true });
+    });
+    range.oninput = () => {
+      begin();
+      const target = sliderToScale(range.value, centre);
+      o.scale = scaleFor(start.v, target); num.value = fmt(target); preview();
+    };
+    range.onchange = commitDrag; // keyboard
+    range.addEventListener('blur', commitDrag);
+    num.onchange = () => {
+      const v = parseFloat(num.value); if (!Number.isFinite(v)) { num.value = fmt(uniformOf(o.scale)); return; } // never commit NaN
+      const before = copyScale(o.scale); commit(before, scaleFor(before, v));
+    };
+    return h('div', { className: 'pc-row' }, h('span', {}, 'scale'), track, num);
+  }
+  // Direction dial: needle = heading as drawn on the plan; drag to turn (15 degree snap, Shift = free), one undo on release.
+  function dialControl(o, room) {
+    const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    const cv = h('canvas', { className: 'dial', width: DIAL * dpr, height: DIAL * dpr, title: 'drag to turn (Shift = free)' });
+    const info = deps.modelInfo ? deps.modelInfo(o.id) : null;
+    const heading = () => displayHeading(o, info); // the way the model's front (screen) faces, where the plan's white dot is
+    const shownDeg = () => Math.round(degrees(heading()));
+    const num = h('input', { type: 'number', step: 'any', value: shownDeg() });
+    const draw = () => {
+      const ctx = cv.getContext('2d'); if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, DIAL, DIAL);
+      const c = DIAL / 2, r = c - 14;
+      ctx.strokeStyle = '#30363d'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(c, c, r, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = '#8b949e'; ctx.lineWidth = 1;
+      for (let i = 0; i < 12; i++) { const a = headingToScreenAngle(radians(i * 30)), sx = Math.sin(a), sy = -Math.cos(a);
+        ctx.beginPath(); ctx.moveTo(c + sx * (r - 5), c + sy * (r - 5)); ctx.lineTo(c + sx * r, c + sy * r); ctx.stroke(); }
+      ctx.fillStyle = '#c9d1d9'; ctx.font = '11px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      [['N', 0], ['E', 90], ['S', 180], ['W', 270]].forEach(([l, d]) => { const a = headingToScreenAngle(radians(d));
+        ctx.fillText(l, c + Math.sin(a) * (r + 8), c - Math.cos(a) * (r + 8)); });
+      const a = headingToScreenAngle(heading());
+      ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(c, c); ctx.lineTo(c + Math.sin(a) * (r - 8), c - Math.cos(a) * (r - 8)); ctx.stroke();
+      ctx.fillStyle = '#58a6ff'; ctx.beginPath(); ctx.arc(c, c, 3, 0, Math.PI * 2); ctx.fill();
+    };
+    let drag = null; // { id, start: rotation copy or undefined }
+    const turnTo = (e) => {
+      const rc = cv.getBoundingClientRect();
+      const target = snapAngle(screenAngleToHeading(pointerToAngle(rc.left + rc.width / 2, rc.top + rc.height / 2, e.clientX, e.clientY)), SNAP_DEG, !!e.shiftKey);
+      const d = angleDelta(heading(), target);
+      if (Math.abs(d) > 1e-12) room.rotateYaw(o, d); // composed onto the existing quaternion (keeps tilt)
+      num.value = shownDeg();
+      draw(); preview();
+    };
+    const restore = (rot) => { if (rot === undefined) delete o.rotation; else o.rotation = { ...rot }; };
+    const cancel = () => { if (drag) { restore(drag.start); drag = null; cv.className = 'dial'; } };
+    cv.addEventListener('pointerdown', (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      e.preventDefault();
+      drag = { id: e.pointerId, start: o.rotation ? { ...o.rotation } : undefined }; activeDrag = cancel;
+      if (cv.setPointerCapture) try { cv.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+      cv.className = 'dial dragging'; turnTo(e);
+    });
+    cv.addEventListener('pointermove', (e) => { if (drag && e.pointerId === drag.id) turnTo(e); });
+    const end = (commit) => (e) => {
+      if (!drag || (e.pointerId !== undefined && e.pointerId !== drag.id)) return;
+      const before = drag.start, after = o.rotation ? { ...o.rotation } : undefined; drag = null; cv.className = 'dial';
+      if (activeDrag === cancel) activeDrag = null;
+      if (cv.releasePointerCapture) try { cv.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
+      restore(before);
+      const same = JSON.stringify(before) === JSON.stringify(after);
+      if (commit && !same) deps.onChange({ label: 'yaw', do: () => restore(after), undo: () => restore(before) });
+      else { draw(); preview(); }
+    };
+    cv.addEventListener('pointerup', end(true));
+    cv.addEventListener('pointercancel', end(false));
+    num.onchange = () => { const v = parseFloat(num.value); if (!Number.isFinite(v)) { num.value = shownDeg(); return; }
+      const b = o.rotation ? { ...o.rotation } : undefined; deps.onChange({ label: 'yaw', do: () => room.setYaw(o, radians(v), heading()), undo: () => restore(b) }); };
+    draw();
+    return h('div', { className: 'pc-row' }, cv, h('div', {}, h('label', {}, 'facing (deg) ', num),
+      h('div', { className: 'hint' }, info && info.front ? 'needle = front (screen side)' : 'front unknown for this model')));
+  }
+  function fieldNum(label, val, onCommit) {
+    const inp = h('input', { type: 'number', step: 'any', value: val });
+    inp.onchange = () => { const v = parseFloat(inp.value); if (!Number.isFinite(v)) { inp.value = val; return; } onCommit(v); }; // never commit NaN (would serialise as null)
+    return h('label', {}, label + ' ', inp);
+  }
+  function show(objs) {
+    if (activeDrag) { const c = activeDrag; activeDrag = null; c(); } // never rebuild over a half-finished drag
+    el.innerHTML = '';
+    if (objs.length !== 1) { el.append(h('div', {}, objs.length ? `${objs.length} selected` : 'Nothing selected')); return; }
+    const o = objs[0], room = deps.room(), cat = deps.catalog();
+    const modelName = (id) => id.replace(/^ugc_/, '');
+    // Game
+    const gl = launchability(o.path || '', cat); const badge = o.path ? `${gl.status} - ${gl.reason}` : 'decor (no game)';
+    const gameSel = h('select'); gameSel.append(h('option', { value: '' }, '(no game / decor)'));
+    const showUnknown = h('input', { type: 'checkbox' });
+    const fillGames = () => { gameSel.innerHTML = ''; gameSel.append(h('option', { value: '' }, '(no game / decor)'));
+      const games = launchableGames(cat, { includeUnknown: showUnknown.checked }); if (o.path && !games.some(g => g.path === o.path)) games.unshift({ path: o.path, system: '(current)', file: o.path });
+      for (const g of games) gameSel.append(h('option', { value: g.path, selected: g.path === o.path }, `${g.system}: ${g.file}${hasAttractVideo(g.path, cat) ? '' : '  (no attract video)'}`)); };
+    fillGames(); showUnknown.onchange = fillGames;
+    gameSel.onchange = () => {
+      // setGame drops the EmuVR-owned crc/open of the old game and may allocate a screen slot; undo restores both
+      const before = o.path, ident = { crc: o.crc, open: o.open }, hadScreen = typeof o.embedded_screen === 'number';
+      deps.onChange({ label: 'game', do: () => room.setGame(o, gameSel.value || null),
+        undo: () => { room.setGame(o, before); if (!hadScreen) room.releaseScreen(o); if (ident.crc !== undefined) o.crc = ident.crc; if (ident.open !== undefined) o.open = ident.open; } });
+      show([o]); };
+    // Model + hint
+    const modelSel = h('select'); const q = h('input', { placeholder: 'search models...' });
+    const fillModels = () => { modelSel.innerHTML = ''; const k = q.value.toLowerCase(); const ms = cat.models.filter(m => m.key.includes(k) || m.id === o.id).slice(0, 300);
+      if (!ms.some(m => m.id === o.id)) ms.unshift({ id: o.id, name: modelName(o.id) }); for (const m of ms) modelSel.append(h('option', { value: m.id, selected: m.id === o.id }, m.name)); };
+    fillModels(); q.oninput = fillModels;
+    const hint = hintFor(o.id, deps.hints());
+    // Real size from the model's extracted bounds: a cabinet built in centimetres at scale 1 stands 100 times too tall.
+    const height = modelHeight(o, deps.modelInfo ? deps.modelInfo(o.id) : null);
+    const fmtM = (m) => (m >= 10 ? String(Math.round(m)) : m.toFixed(2));
+    const sizeTxt = height === null ? '' : (height > 4 || (/^ugc_Arcade_/i.test(o.id) && height < 0.5))
+      ? `SIZE: at this scale it stands about ${fmtM(height)} m tall in VR${hint ? ` - this model is usually at scale ${hint.median}` : ''}`
+      : `stands ${fmtM(height)} m tall in VR`;
+    const hintTxt = hint ? `seen elsewhere at scale ${hint.median} (${hint.samples.map(s => 'Slot' + s.slot + '=' + s.scale).join(', ')})` : 'no size hint for this model';
+    modelSel.onchange = () => { const before = o.id, sBefore = o.scale; const nh = hintFor(modelSel.value, deps.hints());
+      deps.onChange({ label: 'model', do: () => { room.setModel(o, modelSel.value); if (nh) room.setScale(o, nh.median); }, undo: () => { room.setModel(o, before, { verified: true }); room.setScale(o, sBefore); } }); show([o]); };
+    const sugG = o.id ? suggestGamesForModel(o.id, cat).slice(0, 3) : [], sugM = o.path ? suggestModelsForGame(o.path, cat).slice(0, 3) : [];
+    const unverified = room.unverified.has(o);
+    el.append(
+      h('h3', {}, modelName(o.id)),
+      h('div', { className: 'badge ' + (o.path ? gl.status : 'decor') }, badge),
+      h('div', {}, 'Game: ', gameSel, h('label', {}, showUnknown, ' show unknown')),
+      sugG.length ? h('div', { className: 'sug' }, 'Suggested games: ' + sugG.map(g => g.file).join(' | ')) : '',
+      h('div', {}, 'Model: ', q, modelSel),
+      sugM.length ? h('div', { className: 'sug' }, 'Suggested cabinets: ' + sugM.map(m => m.name).join(' | ')) : '',
+      h('div', { className: unverified ? 'warn' : 'hint' }, (unverified ? 'UNVERIFIED SIZE - check in VR. ' : '') + hintTxt),
+      sizeTxt ? h('div', { className: sizeTxt.startsWith('SIZE') ? 'warn' : 'hint' }, sizeTxt) : '',
+      scaleControl(o, room, hint),
+      fieldNum('x', o.position.x, v => { const p = { ...o.position }; deps.onChange({ label: 'x', do: () => room.setPosition(o, v, p.y, p.z), undo: () => room.setPosition(o, p.x, p.y, p.z) }); }),
+      fieldNum('y (height)', o.position.y, v => { const p = { ...o.position }; deps.onChange({ label: 'y', do: () => room.setPosition(o, p.x, v, p.z), undo: () => room.setPosition(o, p.x, p.y, p.z) }); }),
+      fieldNum('z', o.position.z, v => { const p = { ...o.position }; deps.onChange({ label: 'z', do: () => room.setPosition(o, p.x, p.y, v), undo: () => room.setPosition(o, p.x, p.y, p.z) }); }),
+      dialControl(o, room),
+      h('label', {}, h('input', { type: 'checkbox', checked: o.frozen, onchange: (e) => { const b = o.frozen; deps.onChange({ label: 'frozen', do: () => room.setFrozen(o, e.target.checked), undo: () => room.setFrozen(o, b) }); } }), ' frozen (unchecked = edit mode, games stop firing)'),
+      h('div', {}, h('button', { onclick: () => deps.onDuplicate(o) }, 'Duplicate'), ' ', h('button', { onclick: () => deps.onDelete(o) }, 'Delete')),
+    );
+  }
+  let libFill = null;
+  function library() {
+    const box = h('div', { className: 'lib' }); const q = h('input', { placeholder: 'add cabinet/prop: search library...' }); const list = h('select', { size: 8 });
+    // catalogue may not be loaded yet when the library is first built (before a room is loaded)
+    const models = () => { const c = deps.catalog(); return c ? c.models : []; };
+    const fill = () => { list.innerHTML = ''; const k = q.value.toLowerCase(); for (const m of models().filter(m => m.key.includes(k)).slice(0, 200)) list.append(h('option', { value: m.id }, m.name)); };
+    fill(); q.oninput = fill; libFill = fill;
+    const btn = h('button', {}, 'Place selected model (then click on plan)'); btn.onclick = () => { if (list.value) deps.onAddModel(list.value); };
+    box.append(q, list, btn); return box;
+  }
+  // re-populate the library list once the catalogue has been loaded
+  const refreshLibrary = () => { if (libFill) libFill(); };
+  return { show, library, refreshLibrary, get dragging() { return activeDrag !== null; } };
+}
+// ---- src/app.js ----
+
+async function startApp(doc) {
+  const fs = createFs(); const $ = (id) => doc.getElementById(id);
+  let room = null, slot = null, originalText = '', catalog = null, hints = new Map(), plan = null, pendingModel = null;
+  // Model shapes (visible bounds + the way the screen faces) from RoomEditor\models\index.json (tools/extract_models.mjs).
+  let models = null;
+  const modelInfo = (id) => (models && id && models[id]) || null;
+  // Walls: `level` = room-space outline from the level cache (or null), `trace` = the user's traced walls for this slot.
+  // Traced walls live in RoomEditor\walls\traced\Slot<N>.json and are never written into the room file.
+  // `levelNote` = why a cached level outline was not drawn; `traceError` = the traced file exists but could not be read.
+  let level = null, levelName = null, levelNote = null, trace = emptyTrace(), wallsDirty = false, traceError = null;
+  const tracedRel = (s) => `RoomEditor\\walls\\traced\\Slot${s}.json`;
+  const hasTrace = (t) => !!t && ((t.runs && t.runs.length) || (t.current && t.current.length));
+  const stamp = () => new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14).replace(/(\d{8})(\d{6})/, '$1-$2');
+  const wallsStatus = () => {
+    const parts = [];
+    if (level) parts.push(`${levelName} (level)`);
+    if (hasTrace(trace) || wallsDirty) parts.push(wallsDirty ? 'traced (unsaved)' : 'traced');
+    if (traceError) parts.push('traced walls file unreadable');
+    return 'walls: ' + (parts.length ? parts.join(' + ') : `${levelNote || 'none'} — use Trace walls`);
+  };
+  const syncTraceButton = () => { $('trace').textContent = plan && plan.traceMode ? 'Done tracing' : 'Trace walls'; };
+  const stack = new CommandStack();
+  const status = (m) => { $('status').textContent = m; };
+  const memo = new Map(); const exists = async (rel) => { if (!memo.has(rel)) memo.set(rel, await fs.exists(rel)); return memo.get(rel); };
+
+  // Game files are pre-listed, so launchability's fileExists never has to touch the disk.
+  const gameFileExists = (gameFiles) => { const s = new Set(); for (const [sys, files] of Object.entries(gameFiles || {})) for (const f of files) s.add(`Games\\${sys}\\${f}`.toLowerCase()); return (rel) => s.has(rel.toLowerCase()); };
+  // Fallback (no File System Access API): tools/gen_manifest.ps1 writes manifest.js = window.RAVE_MANIFEST with the buildCatalog listings shape.
+  function loadManifestCatalog(m) {
+    const tpSeen = new Map(Object.entries(m.tpGamePathExists || {}));
+    catalog = buildCatalog({ ugcNames: m.ugcNames, gameFiles: m.gameFiles, winTexts: m.winTexts, tpProfiles: m.tpProfiles, m2Roms: m.m2Roms, m3Roms: m.m3Roms, videoNames: m.videoNames, daphneFrames: m.daphneFrames,
+      fileExists: gameFileExists(m.gameFiles), tpGamePathExists: (abs) => tpSeen.has(abs) ? tpSeen.get(abs) : null }); // null = not probed -> unknown
+    status(`library (manifest.js): ${catalog.models.length} models, ${catalog.games.length} games`);
+  }
+  // Recursive file listing (relative paths under `rel`, excluding the `rel` prefix); [] if the folder is missing.
+  async function listTree(rel) {
+    const out = []; const walk = async (dir, prefix) => { const l = await fs.listDir(dir); for (const f of l.files) out.push(prefix + f); for (const d of l.dirs) await walk(dir + '\\' + d, prefix + d + '\\'); };
+    try { await walk(rel, ''); } catch {} return out;
+  }
+  async function loadCatalog() {
+    if (fs.mode !== 'fsa') {
+      if (typeof window !== 'undefined' && window.RAVE_MANIFEST) { loadManifestCatalog(window.RAVE_MANIFEST); return; }
+      catalog = buildCatalog({}); status('no manifest.js - badges unavailable (run tools\\gen_manifest.ps1)'); return;
+    }
+    status('reading library...');
+    const ugc = (await fs.listDir('Custom\\UGC\\Arcade')).files.filter(f => /\.ugc$/i.test(f)).map(f => f.replace(/\.ugc$/i, ''));
+    // probe: game folders hold symlinks, and a dangling one must not count as a present game
+    const gameFiles = {}; for (const d of (await fs.listDir('Games')).dirs) gameFiles[d] = (await fs.listDir('Games\\' + d, { probe: true })).files;
+    const winTexts = {}; for (const d of Object.keys(gameFiles).filter(d => /^Arcade \(Capture\)/i.test(d)))
+      for (const f of gameFiles[d].filter(f => /\.win$/i.test(f))) winTexts[`Games\\${d}\\${f}`] = await fs.readText(`Games\\${d}\\${f}`);
+    const tpProfiles = {}; try { for (const f of (await fs.listDir('Emulators\\TeknoParrot\\UserProfiles')).files.filter(f => /\.xml$/i.test(f))) tpProfiles[f.replace(/\.xml$/i, '')] = await fs.readText('Emulators\\TeknoParrot\\UserProfiles\\' + f); } catch {}
+    const safeList = async (rel) => { try { return (await fs.listDir(rel)).files; } catch { return []; } };
+    catalog = buildCatalog({ ugcNames: ugc, gameFiles, winTexts, tpProfiles,
+      m2Roms: await safeList('Emulators\\M2emulator\\roms\\RetroBat'), m3Roms: await safeList('Emulators\\SuperModel 3\\roms\\RetroBat'),
+      videoNames: (await safeList('Custom\\Videos\\Arcade')).map(f => f.replace(/\.[^.]+$/, '')),
+      daphneFrames: (await listTree('Emulators\\Daphne\\vldp')).map(p => 'vldp\\' + p),
+      fileExists: gameFileExists(gameFiles),
+    });
+    // A TeknoParrot GamePath is absolute; only the part under the picked root can be probed from the browser.
+    // Anything else stays null (-> unknown badge), never a guess.
+    const tpSeen = new Map(); const rootTag = `\\${fs.rootName}\\`.toUpperCase();
+    for (const gp of [...catalog.tpProfiles.values()].map(p => p.gamePath).filter(Boolean)) {
+      const i = gp.toUpperCase().indexOf(rootTag);
+      tpSeen.set(gp, i < 0 ? null : await exists(gp.slice(i + rootTag.length)));
+    }
+    catalog.tpGamePathExists = (abs) => tpSeen.has(abs) ? tpSeen.get(abs) : null;
+    status(`library: ${catalog.models.length} models, ${catalog.games.length} games`);
+  }
+  // Read every Saved Data\Rooms\Slot<N>.json (re-read on each room load so hints reflect the files on disk).
+  async function readRooms() {
+    const rooms = []; for (const f of (await fs.listDir('Saved Data\\Rooms')).files.filter(f => /^Slot\d+\.json$/i.test(f))) rooms.push({ slot: f.match(/\d+/)[0], text: await fs.readText('Saved Data\\Rooms\\' + f) });
+    return rooms;
+  }
+  const badge = (o) => o.path ? launchability(o.path, catalog).status : 'decor';
+  function change(cmd) { stack.execute(cmd); plan.render(); panel.show([...plan.selection]); $('undo').disabled = !stack.canUndo; $('redo').disabled = !stack.canRedo; }
+  const panel = createPanel($('panel'), { room: () => room, catalog: () => catalog, hints: () => hints, onChange: change, modelInfo,
+    preview: () => plan && plan.render(), // live slider/dial preview: re-render only, no undo entry
+    onDelete: (o) => {
+      // remove() renumbers screens across objects+systems, so undo restores every array (same object references) and every embedded_screen
+      const snap = room.snapshot(), wasUnverified = room.unverified.has(o);
+      plan.selection.clear();
+      change({ label: 'delete', do: () => room.remove(o), undo: () => { room.restore(snap); if (wasUnverified) room.unverified.add(o); } });
+    },
+    onDuplicate: (o) => { let made; change({ label: 'duplicate', do: () => { made = room.add({ id: o.id, path: o.path, x: o.position.x + 1, z: o.position.z, y: o.position.y, yaw: 0, scale: o.scale ?? 1, screen: typeof o.embedded_screen === 'number', home: room.homeOf(o) }, { verified: !room.unverified.has(o) }); if (o.rotation) made.rotation = { ...o.rotation }; }, undo: () => room.remove(made) }); },
+    onAddModel: (id) => { if (!plan) { status('load a room first'); return; } pendingModel = id; plan.setAddMode(true); status('click on the plan to place ' + id); } });
+  async function loadRoom(n) {
+    const text = await fs.readText(`Saved Data\\Rooms\\Slot${n}.json`);
+    await openRoom(text, String(n));
+  }
+  // Room chosen with the file input. With folder access an in-place save is only allowed when the file IS a
+  // Slot<N>.json (a backup such as Slot6.json.bak must never overwrite the live Slot6.json); otherwise slot = null
+  // and Save falls back to a download. Without folder access the digits only name the download.
+  async function loadRoomFromFile(file) {
+    const text = await fs.loadRoomViaInput(file);
+    const exact = /^Slot(\d+)\.json$/i.exec(file.name), loose = /(\d+)/.exec(file.name);
+    const slotStr = fs.mode === 'fsa' ? (exact ? exact[1] : null) : (exact ? exact[1] : (loose ? loose[1] : '0'));
+    await openRoom(text, slotStr);
+    if (fs.mode === 'fsa' && !slotStr) status(`${file.name} is not a Slot<N>.json - Save will download instead of writing in place`);
+  }
+  // Walls for a room, read into locals only. A missing or unreadable file is not an error (no folder access, no cache,
+  // nothing traced yet); the level cache holds level-local segments that are placed by the room's level object.
+  async function readWalls(parsed, slotStr) {
+    const out = { level: null, levelName: null, levelNote: null, trace: emptyTrace(), traceError: null };
+    if (fs.mode !== 'fsa' || !fs.rootName) return out; // no folder access: no caches, nothing traced
+    // A level object is recognised by having a level cache (the extractor caches level bundles only, never props);
+    // candidates are checked in room order and the first whose outline and placement fit is drawn.
+    let cached = [];
+    try { cached = (await fs.listDir('RoomEditor\\walls\\levels')).files.filter(f => /\.json$/i.test(f)).map(f => f.replace(/\.json$/i, '')); } catch { /* no cache folder */ }
+    if (cached.length) {
+      for (const lo of levelCandidates(parsed, new Set(cached))) {
+        let json;
+        try { json = JSON.parse((await fs.readText(`RoomEditor\\walls\\levels\\${lo.id}.json`)).replace(/^\s+/, '')); }
+        catch { out.levelNote = 'level outline cache unreadable'; continue; }
+        const fit = levelWallsFit(json, lo);
+        if (!fit.ok) { out.levelNote = fit.reason; continue; }
+        out.level = transformOutline(json.segments, lo); out.levelName = levelDisplayName(lo.id); out.levelNote = null;
+        break;
+      }
+    }
+    if (slotStr !== null && slotStr !== undefined) {
+      try { out.trace = parseTrace(await fs.readText(tracedRel(slotStr))); }
+      catch (e) { if (!e || e.name !== 'NotFoundError') out.traceError = (e && e.message) || String(e); } // missing = nothing traced yet
+    }
+    return out;
+  }
+  // Save/Clear would overwrite a traced file that exists but could not be read: keep it as .bak-<time> first.
+  async function backupUnreadableTrace() {
+    if (!traceError || slot === null) return;
+    let old = null; try { old = await fs.readText(tracedRel(slot)); } catch { /* gone since */ }
+    if (old !== null) await fs.writeText(`${tracedRel(slot)}.bak-${stamp()}`, old);
+  }
+  // Model shapes for footprints and front dots; {} (guessed boxes, no dots) without folder access or before extraction.
+  async function readModels() {
+    if (fs.mode !== 'fsa' || !fs.rootName) return {};
+    try {
+      const j = JSON.parse((await fs.readText('RoomEditor\\models\\index.json')).replace(/^\s+/, ''));
+      return j && j.models && typeof j.models === 'object' ? j.models : {};
+    } catch { return {}; }
+  }
+  // Everything is parsed and prepared into locals first; module state is only replaced once nothing can throw,
+  // so a corrupt file never leaves `slot` pointing at a file the old in-memory room could then be saved over.
+  async function openRoom(text, slotStr) {
+    if (wallsDirty && hasTrace(trace) && !confirm('Traced walls for the current room are not saved. Discard them and load another room?')) { status('load cancelled - click Save walls first'); return; }
+    const parsed = Room.parse(text); parsed.slot = slotStr;
+    if (!catalog) { await loadCatalog(); panel.refreshLibrary(); }
+    let others = []; try { others = await readRooms(); } catch { others = []; } // no folder access: no cross-room hints
+    const newHints = buildHints(others, { excludeSlot: slotStr });
+    const walls = await readWalls(parsed, slotStr);
+    if (models === null || !Object.keys(models).length) models = await readModels();
+    if (!plan) {
+      plan = createPlan($('plan'), parsed, { badge, modelName: (id) => id.replace(/^ugc_/, ''), onSelect: (objs) => panel.show(objs), busy: () => panel.dragging, modelInfo,
+        onTraceChange: (t) => { trace = t; wallsDirty = true; syncTraceButton(); status(`Slot ${slot ?? '?'}: ${wallsStatus()}`); },
+        onMove: (objs, dx, dz) => { const before = objs.map(o => ({ ...o.position })); change({ label: 'move', do: () => objs.forEach(o => room.setPosition(o, o.position.x + dx, o.position.y, o.position.z + dz)), undo: () => objs.forEach((o, i) => room.setPosition(o, before[i].x, before[i].y, before[i].z)) }); },
+        onRotate: (objs, d) => { const before = objs.map(o => o.rotation && { ...o.rotation }); change({ label: 'rotate', do: () => objs.forEach(o => room.rotateYaw(o, d)), undo: () => objs.forEach((o, i) => { o.rotation = before[i]; }) }); },
+        onPlaceClick: (x, z) => { const id = pendingModel; if (!id) { plan.setAddMode(false); return; } const hint = hintFor(id, hints); let made; change({ label: 'add', do: () => { made = room.add({ id, x, z, scale: hint ? hint.median : 1 }); }, undo: () => room.remove(made) }); pendingModel = null; plan.setAddMode(false); plan.selection.clear(); plan.selection.add(made); plan.render(); panel.show([made]); } });
+      window.addEventListener('resize', () => plan && plan.render());
+      // the plan leaves trace mode by itself on Esc; registered after createPlan's keydown listener, so this runs after it
+      window.addEventListener('keydown', () => {
+        const was = $('trace').textContent; syncTraceButton();
+        if (was !== $('trace').textContent && plan && !plan.traceMode) status(`Slot ${slot ?? '?'}: ${wallsStatus()}`); // left trace mode with Esc
+      });
+    }
+    room = parsed; slot = slotStr; originalText = text; hints = newHints;
+    stack.done = []; stack.undone = []; $('undo').disabled = true; $('redo').disabled = true;
+    level = walls.level; levelName = walls.levelName; levelNote = walls.levelNote; trace = walls.trace; traceError = walls.traceError;
+    plan.setRoom(room);
+    plan.setWalls({ level, traced: trace }); // resets the plan's trace, so leaving trace mode below has nothing to close
+    plan.setTraceMode(false); wallsDirty = false; syncTraceButton();
+    plan.fitToRoom(); plan.render(); panel.show([]); status(`Slot ${slot ?? '?'}: ${room.placed().length} objects | ${wallsStatus()}`);
+  }
+  async function saveWalls() {
+    if (!plan || !room) { status('load a room first'); return; }
+    const text = serializeTrace(slot, trace);
+    if (fs.mode !== 'fsa' || slot === null) { fs.download(`Slot${slot ?? 0}.walls.json`, text); status('walls downloaded - put it in RoomEditor\\walls\\traced as Slot<N>.json'); return; }
+    await backupUnreadableTrace();
+    await fs.writeText(tracedRel(slot), text); // separate sidecar file; the room file is never touched
+    wallsDirty = false; traceError = null; status(`saved traced walls for Slot ${slot} | ${wallsStatus()}`);
+  }
+  async function clearWalls() {
+    if (!plan || !room) { status('load a room first'); return; }
+    if (!confirm(`Clear the traced walls for Slot ${slot ?? '?'}? Level walls (if any) stay.`)) return;
+    const text = serializeTrace(slot, emptyTrace()); // { slot, runs: [] }
+    const cleared = () => { trace = emptyTrace(); plan.setWalls({ level, traced: trace }); wallsDirty = false; }; // only once the file is written
+    if (fs.mode !== 'fsa' || slot === null) { fs.download(`Slot${slot ?? 0}.walls.json`, text); cleared(); status('traced walls cleared (empty walls file downloaded)'); return; }
+    await backupUnreadableTrace();
+    await fs.writeText(tracedRel(slot), text);
+    cleared(); traceError = null; status(`cleared traced walls for Slot ${slot} | ${wallsStatus()}`);
+  }
+  async function save() {
+    if (!room) { status('nothing loaded'); return; }
+    const v = room.validate({ launchability: (p) => launchability(p, catalog).status, unverified: room.unverified });
+    if (v.errors.length) { alert('NOT SAVED - structural errors:\n' + v.errors.join('\n')); return; }
+    if (v.warnings.length && !confirm('Warnings:\n' + v.warnings.slice(0, 20).join('\n') + '\n\nSave anyway?')) return;
+    const text = room.serialize(); if (text.charCodeAt(0) !== 0x7b) { alert('refusing to save: bad first byte'); return; }
+    const target = room.slot; // the slot this room was loaded from, not a module variable that could have drifted
+    if (fs.mode !== 'fsa' || target === null) { fs.download(`Slot${target ?? slot ?? 0}.json`, text); status('downloaded - drop it into Saved Data\\Rooms'); return; }
+    const ts = stamp();
+    const rel = `Saved Data\\Rooms\\Slot${target}.json`;
+    // The backup must hold what is being replaced: the file as it is on disk NOW (EmuVR may have re-saved it since load).
+    let onDisk = null; try { onDisk = await fs.readText(rel); } catch {}
+    if (onDisk !== null && onDisk !== originalText && !confirm(`Slot ${target} changed on disk since you loaded it (saved from VR?). Overwrite it anyway? The current file will be kept as .bak-${ts}.`)) { status('save cancelled - reload the room to pick up the on-disk changes'); return; }
+    await fs.writeText(`${rel}.bak-${ts}`, onDisk ?? originalText);
+    await fs.writeText(rel, text); originalText = text; status(`saved Slot ${target} (backup .bak-${ts})`);
+  }
+  $('pick').onclick = async () => { await fs.pickRoot(); catalog = null; models = null; memo.clear(); status('root: ' + fs.rootName); };
+  $('load').onclick = () => loadRoom($('slot').value).catch(e => status('load failed: ' + e.message));
+  $('file').onchange = (e) => { const f = e.target.files[0]; if (f) loadRoomFromFile(f).catch(err => status('load failed: ' + err.message)); e.target.value = ''; };
+  $('save').onclick = () => save().catch(e => status('save failed: ' + e.message));
+  const afterHistory = () => { for (const o of [...plan.selection]) if (!room.homeOf(o)) plan.selection.delete(o); plan.render(); panel.show([...plan.selection]); $('undo').disabled = !stack.canUndo; $('redo').disabled = !stack.canRedo; };
+  $('undo').onclick = () => { if (!plan) return; stack.undo(); afterHistory(); };
+  $('redo').onclick = () => { if (!plan) return; stack.redo(); afterHistory(); };
+  $('align').onclick = () => { if (!plan) return; const sel = [...plan.selection]; if (sel.length < 2) return; const z = sel[0].position.z; const before = sel.map(o => ({ ...o.position })); change({ label: 'align', do: () => sel.forEach(o => room.setPosition(o, o.position.x, o.position.y, z)), undo: () => sel.forEach((o, i) => room.setPosition(o, before[i].x, before[i].y, before[i].z)) }); };
+  $('trace').onclick = () => {
+    if (!plan) { status('load a room first'); return; }
+    const on = !plan.traceMode;
+    if (on && pendingModel) { pendingModel = null; plan.setAddMode(false); }
+    plan.setTraceMode(on); syncTraceButton();
+    status(on ? 'tracing walls - click corners on the plan' : `Slot ${slot ?? '?'}: ${wallsStatus()}`);
+  };
+  $('savewalls').onclick = () => saveWalls().catch(e => status('save walls failed: ' + e.message));
+  $('clearwalls').onclick = () => clearWalls().catch(e => status('clear walls failed: ' + e.message));
+  $('library').append(panel.library());
+  status(fs.mode === 'fsa'
+    ? 'Start here: click "Pick EmuVR folder", choose your EmuVR folder (the one with Saved Data and Custom), then Load a slot'
+    : 'fallback mode: folder access unavailable - load via file, save = download');
+}
+// ---- index.html bootstrap ----
+
+const c = document.getElementById('plan'); const fit = () => { c.width = c.clientWidth; c.height = c.clientHeight; }; fit(); window.addEventListener('resize', fit);
+startApp(document);
+</script></body></html>

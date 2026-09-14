@@ -1,0 +1,46 @@
+{
+  "levelId": "ugc_Medium_Theater_6784b027",
+  "source": "Medium_Theater_6784b027_[temp_level_stopgap_12345789].ugc",
+  "sliceY": -5.493,
+  "usedBy": [],
+  "segments": [
+    [-96.04,111.82,95.75,111.82],
+    [-96.04,-83.24,95.75,-83.24],
+    [95.75,-83.24,95.75,111.82],
+    [-96.04,-83.24,-96.04,111.82]
+  ],
+  "bounds": {"minX":-96.04,"maxX":95.75,"minZ":-83.24,"maxZ":111.82},
+  "stats": {
+    "meshColliders": 0,
+    "boxColliders": 6,
+    "skippedCompressed": 0,
+    "skippedExternal": 0,
+    "skippedDisabled": 0,
+    "skippedNullMesh": 0,
+    "skippedFormat": 0,
+    "badIndices": 0,
+    "triangles": 72,
+    "root": {
+      "name": "VR Cinema",
+      "position": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "rotation": {
+        "x": 0,
+        "y": 0,
+        "z": 0,
+        "w": 1
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "via": "container"
+    },
+    "floorY": -6.493,
+    "rawSegments": 8
+  }
+}
